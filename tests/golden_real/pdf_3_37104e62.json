@@ -1,0 +1,16 @@
+{
+  "expected_dominant_type": "CONSENT",
+  "expected_actionable_min": 0,
+  "expected_actionable_max": 0,
+  "expected_subtypes_present": [
+    "LONG_SENTENCE"
+  ],
+  "expected_subtypes_absent": [],
+  "expected_page_types": {
+    "1": "CONSENT"
+  },
+  "expected_page_type_min_confidence": {
+    "1": 0.9
+  },
+  "notes": "Edit these expectations to tighten recall/precision for regression."
+}

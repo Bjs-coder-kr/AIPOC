@@ -1,0 +1,12 @@
+{
+  "pages": [
+    {
+      "page_number": 1,
+      "text": "Resume\nExperience: Data Engineer.\nSkills: Python, SQL.\nEducation: MSc Computer Science."
+    },
+    {
+      "page_number": 2,
+      "text": "Privacy policy and third party consent form. Retention period and notice details are provided."
+    }
+  ]
+}
