@@ -1,0 +1,11 @@
+{
+  "expected_dominant_type": "RESUME",
+  "expected_actionable_min": 1,
+  "expected_actionable_max": 5,
+  "expected_subtypes_present": [
+    "COMMON_KO_TYPO"
+  ],
+  "expected_subtypes_absent": [
+    "LONG_SENTENCE"
+  ]
+}

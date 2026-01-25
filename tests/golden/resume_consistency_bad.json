@@ -1,0 +1,12 @@
+{
+  "expected_dominant_type": "RESUME",
+  "expected_actionable_min": 1,
+  "expected_actionable_max": 3,
+  "expected_subtypes_present": [
+    "DATE_FORMAT_INCONSISTENCY",
+    "NUMBER_FORMAT_INCONSISTENCY"
+  ],
+  "expected_subtypes_absent": [
+    "LONG_SENTENCE"
+  ]
+}
