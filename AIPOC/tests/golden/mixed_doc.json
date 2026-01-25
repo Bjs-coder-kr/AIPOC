@@ -1,0 +1,12 @@
+{
+  "expected_dominant_type": "MIXED",
+  "expected_actionable_min": 0,
+  "expected_actionable_max": 0,
+  "expected_subtypes_present": [],
+  "expected_subtypes_absent": [
+    "LONG_SENTENCE",
+    "INCONSISTENCY",
+    "BOILERPLATE_REPEAT",
+    "VERBATIM_DUPLICATE"
+  ]
+}
