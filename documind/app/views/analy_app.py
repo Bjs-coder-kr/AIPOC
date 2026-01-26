@@ -1753,6 +1753,50 @@ def render_sqlite_explorer():
             df = df.rename(columns=cols)
             st.dataframe(df, use_container_width=True, hide_index=True)
             
+            # Detail View for Download
+            st.subheader("Detail View")
+            all_ids = [item["id"] for item in history]
+            selected_id = st.selectbox(
+                "Select ID to view full content",
+                options=all_ids,
+                key="sqlite_history_detail_select"
+            )
+            
+            if selected_id:
+                detail = db_manager.get_history_detail(selected_id)
+                if detail:
+                    # Check if it's an optimization result with rewritten_text
+                    rewritten_text = detail.get("rewritten_text")
+                    if rewritten_text:
+                        from documind.utils.export import create_txt_bytes, create_pdf_bytes
+                        fname_base = f"sqlite_export_{selected_id}"
+                        
+                        sq_col1, sq_col2 = st.columns(2)
+                        with sq_col1:
+                            st.download_button(
+                                label="💾 Download TXT",
+                                data=create_txt_bytes(rewritten_text),
+                                file_name=f"{fname_base}.txt",
+                                mime="text/plain",
+                                key=f"sqlite_dl_txt_{selected_id}"
+                            )
+                        with sq_col2:
+                            st.download_button(
+                                label="📄 Download PDF",
+                                data=create_pdf_bytes(rewritten_text),
+                                file_name=f"{fname_base}.pdf",
+                                mime="application/pdf",
+                                key=f"sqlite_dl_pdf_{selected_id}"
+                            )
+                        
+                        st.text_area("Rewritten Text", value=rewritten_text, height=300)
+                    else:
+                        st.info("이 항목은 최적화 결과가 아닙니다 (다운로드 불가)." if t.get("lang") == "ko" else "This item is not an optimization result (no download available).")
+                    
+                    st.json(detail)
+                else:
+                    st.warning("Failed to load details.")
+            
     elif selected_tab == "User List" and is_admin:
         st.subheader("Registered Users")
         users = db_manager.get_all_users()
