@@ -16,5 +16,6 @@ chromadb>=0.4.24
 python-docx
 pytest
 reportlab
-
-
+rank_bm25
+tiktoken
+typing_extensions

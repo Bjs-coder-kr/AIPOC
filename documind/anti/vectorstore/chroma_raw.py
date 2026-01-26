@@ -4,7 +4,7 @@ from pathlib import Path
 from documind.utils.pydantic_compat import patch_pydantic_v1_for_chromadb
 
 
-PERSIST_DIR = str(Path(__file__).resolve().parents[3] / "chroma_raw")
+PERSIST_DIR = str(Path(__file__).resolve().parents[3] / "chroma_raw_v2")
 
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -18,6 +18,7 @@ def save_raw_docs(docs):
     patch_pydantic_v1_for_chromadb()
     import chromadb
     
+    # ChromaDB 0.4+ style persistence
     client = chromadb.PersistentClient(path=PERSIST_DIR)
     
     # Use 'langchain' collection to match previous behavior
@@ -34,11 +35,7 @@ def save_raw_docs(docs):
         metadatas=metadatas,
         ids=ids
     )
-    # Persist data explicitly if needed (0.3.x sometimes requires it)
-    try:
-        client.persist()
-    except AttributeError:
-        pass 
+    # PersistentClient auto-persists, no need to call persist()
         
     return collection
 

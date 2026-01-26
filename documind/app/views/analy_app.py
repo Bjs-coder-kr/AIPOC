@@ -35,8 +35,16 @@ from documind.ai.client import OpenAIClient
 from documind.ai.redact import redact_text, truncate_text
 from documind.ingest.pdf_loader import PARTIAL_SCAN_THRESHOLD
 from documind.ingest.loader import load_document
-from documind.llm.config import get_analysis_config, get_available_providers, get_available_embedding_providers, get_default_actor_provider, get_default_critic_provider
+from documind.llm.config import (
+    get_analysis_config,
+    get_available_providers,
+    get_available_embedding_providers,
+    get_default_actor_provider,
+    get_default_critic_provider,
+    get_default_embedding_provider,
+)
 from documind.utils.db import db_manager
+from documind.utils.best_practice_manager import archive_best_practice
 from documind.profile.classify import (
     classify_pages,
     classify_text,
@@ -83,6 +91,10 @@ I18N = {
         "optim_result_title": "최적화 결과",
         "optim_analysis_title": "분석",
         "optim_keywords_label": "키워드",
+        "optim_accept_button": "수락",
+        "optim_retry_button": "다시 시도",
+        "optim_decision_title": "사용자 확인",
+        "optim_decision_prompt": "점수가 {score}점입니다. 결과를 수락할까요?",
         "anti_indexed": "문서 인덱싱 완료.",
         "anti_preview_title": "OCR / 텍스트 추출 결과 미리보기",
         "anti_question_label": "문서에 대해 질문하세요",
@@ -261,6 +273,10 @@ I18N = {
         "optim_result_title": "Optimized Result",
         "optim_analysis_title": "Analysis",
         "optim_keywords_label": "Keywords",
+        "optim_accept_button": "Accept",
+        "optim_retry_button": "Retry",
+        "optim_decision_title": "Review Required",
+        "optim_decision_prompt": "Score is {score}. Accept this result?",
         "anti_indexed": "Document indexed.",
         "anti_preview_title": "OCR / Extracted text preview",
         "anti_question_label": "Ask a question about the document",
@@ -897,6 +913,7 @@ if "rag_running" not in st.session_state:
 if "analysis_mode" not in st.session_state:
     st.session_state["analysis_mode"] = "quality"
 analysis_config = get_analysis_config()
+ARCHIVE_THRESHOLD = analysis_config.get("archive_threshold", 95)
 default_provider = analysis_config.get("default_provider", "Gemini CLI")
 if "optim_provider" not in st.session_state:
     st.session_state["optim_provider"] = default_provider
@@ -914,11 +931,21 @@ if "critic_provider" not in st.session_state:
 
 if "embedding_provider" not in st.session_state:
     saved = db_manager.get_setting("embedding_provider")
-    st.session_state["embedding_provider"] = saved if saved else "OpenAI"
+    default_embed = saved if saved else get_default_embedding_provider()
+    embed_options = get_available_embedding_providers()
+    st.session_state["embedding_provider"] = (
+        default_embed if default_embed in embed_options else get_default_embedding_provider()
+    )
 if "optim_result" not in st.session_state:
     st.session_state["optim_result"] = None
 if "optim_error" not in st.session_state:
     st.session_state["optim_error"] = None
+if "optim_session" not in st.session_state:
+    st.session_state["optim_session"] = None
+if "optim_state" not in st.session_state:
+    st.session_state["optim_state"] = None
+if "optim_engine" not in st.session_state:
+    st.session_state["optim_engine"] = None
 if "anti_docs" not in st.session_state:
     st.session_state["anti_docs"] = None
 if "anti_indexed" not in st.session_state:
@@ -1411,6 +1438,83 @@ def _run_rag_qa(
     }
 
 
+def _advance_optim_session(decision: str | None = None):
+    session = st.session_state.get("optim_session") or {}
+    generator = session.get("generator")
+    if generator is None:
+        return None, True
+
+    state = None
+    done = False
+    try:
+        while True:
+            if decision is not None:
+                state = generator.send(decision)
+                decision = None
+            else:
+                state = next(generator)
+            session["state"] = state
+            st.session_state["optim_state"] = state
+            if getattr(state, "decision_required", False):
+                break
+            if getattr(state, "status", "") == "PASS":
+                done = True
+                break
+    except StopIteration as stop:
+        state = stop.value or state
+        session["state"] = state
+        st.session_state["optim_state"] = state
+        done = True
+
+    st.session_state["optim_session"] = session
+    return state, done
+
+
+def _archive_optim_result(result: dict | None) -> None:
+    if not result:
+        return
+    score = result.get("analysis", {}).get("score", 0) or 0
+    if score < ARCHIVE_THRESHOLD:
+        return
+    success = archive_best_practice(
+        result,
+        embedding_provider=st.session_state.get(
+            "embedding_provider", get_default_embedding_provider()
+        ),
+        min_score=ARCHIVE_THRESHOLD,
+    )
+    if success:
+        st.toast(f"🏆 High Score ({score})! Archived to Best Practices.", icon="💾")
+
+
+def _append_optim_to_anti_docs(result: dict | None, filename: str | None) -> None:
+    if not result or not filename:
+        return
+    score = result.get("analysis", {}).get("score", 0) or 0
+    if score < ARCHIVE_THRESHOLD:
+        return
+    rewritten = result.get("rewritten_text", "")
+    if not rewritten:
+        return
+    try:
+        from langchain_core.documents import Document
+    except Exception:
+        return
+    new_doc = Document(
+        page_content=rewritten,
+        metadata={
+            "source": f"Optimized: {filename}",
+            "score": score,
+            "level": st.session_state.get("optim_level"),
+        },
+    )
+    if "anti_docs" not in st.session_state or st.session_state["anti_docs"] is None:
+        st.session_state["anti_docs"] = []
+    st.session_state["anti_docs"].append(new_doc)
+    st.session_state["rag_index_cache"] = {}
+    st.session_state["anti_indexed"] = True
+
+
 def _status_from_result(result, error: str | None) -> str:
     if error:
         return "error"
@@ -1668,56 +1772,93 @@ def render_chroma_explorer():
     
     # Path calculation relative to this file
     # analy_app.py is in AIPOC/app/views/
-    persist_dir = str(Path(__file__).resolve().parents[3] / "chroma_raw")
+    persist_dir_raw = str(Path(__file__).resolve().parents[3] / "chroma_raw_v2")
+    persist_dir_best = str(Path(__file__).resolve().parents[3] / "chroma_best_practices_v2")
     
-    try:
-        client = chromadb.PersistentClient(path=persist_dir)
-        
-        # 0.3.x does not support list_collections easily or it might vary.
-        # But we know we used 'langchain' in save_raw_docs.
-        # Let's try to get 'langchain' directly.
+    tab_rag, tab_best = st.tabs(["📚 RAG Documents", "🏆 Best Practices"])
+    
+    with tab_rag:
         try:
-            collection = client.get_collection(name="langchain")
-        except Exception:
-             st.info("No 'langchain' collection found in ChromaDB.")
-             return
-
-        # ChromaDB query with filtering
-        if is_admin:
-            results = collection.get() # Admin sees all
-        else:
-            results = collection.get(where={"user_id": username})
+            client = chromadb.PersistentClient(path=persist_dir_raw)
+            try:
+                collection = client.get_collection(name="langchain")
+            except Exception:
+                st.info("No 'langchain' collection found in ChromaDB.")
+                collection = None
             
-        if not results or not results.get("documents"):
-            st.info("No data in ChromaDB for current user.")
-        else:
-            docs = results["documents"]
-            metas = results["metadatas"]
-            ids = results["ids"]
+            if collection:
+                if is_admin:
+                    results = collection.get()
+                else:
+                    results = collection.get(where={"user_id": username})
+                    
+                if not results or not results.get("documents"):
+                    st.info("No RAG data for current user.")
+                else:
+                    docs = results["documents"]
+                    metas = results["metadatas"]
+                    ids = results["ids"]
+                    
+                    display_data = []
+                    for i in range(len(docs)):
+                        m = metas[i] or {}
+                        display_data.append({
+                            "ID": ids[i][:8] + "...",
+                            t["doc_filename"]: m.get("source", m.get("filename", "N/A")),
+                            "Page": m.get("page", "N/A"),
+                            t["doc_user"]: m.get("user_id", "N/A"),
+                            t["rag_content"]: docs[i][:200] + "..." if len(docs[i]) > 200 else docs[i]
+                        })
+                    
+                    import pandas as pd
+                    df = pd.DataFrame(display_data)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Failed to load RAG ChromaDB: {e}")
+    
+    with tab_best:
+        try:
+            client_best = chromadb.PersistentClient(path=persist_dir_best)
+            try:
+                collection_best = client_best.get_collection(name="optim_best_practices_v1")
+            except Exception:
+                st.info("No best practices collection found. High-scoring results will appear here.")
+                collection_best = None
             
-            display_data = []
-            for i in range(len(docs)):
-                m = metas[i] or {}
-                display_data.append({
-                    "ID": ids[i],
-                    t["doc_filename"]: m.get("source", m.get("filename", "N/A")),
-                    "Page": m.get("page", "N/A"),
-                    t["doc_user"]: m.get("user_id", "N/A"),
-                    t["rag_content"]: docs[i][:200] + "..." if len(docs[i]) > 200 else docs[i]
-                })
-            
-            import pandas as pd
-            df = pd.DataFrame(display_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            
-            # Detail view
-            st.subheader("Detail View")
-            selected_id = st.selectbox("Select ID to view full content", options=ids, key="chroma_detail_select")
-            if selected_id:
-                idx = ids.index(selected_id)
-                st.text_area("Full Content", value=docs[idx], height=300)
-    except Exception as e:
-        st.error(f"Failed to load ChromaDB: {e}")
+            if collection_best:
+                results_best = collection_best.get(include=["documents", "metadatas"])
+                    
+                if not results_best or not results_best.get("documents"):
+                    st.info("No best practices archived yet.")
+                else:
+                    docs_b = results_best["documents"]
+                    metas_b = results_best["metadatas"]
+                    ids_b = results_best["ids"]
+                    
+                    display_data_b = []
+                    for i in range(len(docs_b)):
+                        m = metas_b[i] or {}
+                        display_data_b.append({
+                            "ID": ids_b[i][:8] + "...",
+                            "Score": m.get("score", "N/A"),
+                            "Level": m.get("target_level", "N/A"),
+                            "Model": m.get("model_version", "N/A"),
+                            "Timestamp": m.get("timestamp", "N/A")[:19] if m.get("timestamp") else "N/A",
+                            "Content": docs_b[i][:150] + "..." if len(docs_b[i]) > 150 else docs_b[i]
+                        })
+                    
+                    import pandas as pd
+                    df_b = pd.DataFrame(display_data_b)
+                    st.dataframe(df_b, use_container_width=True, hide_index=True)
+                    
+                    st.subheader("Detail View")
+                    selected_id_b = st.selectbox("Select ID to view full content", options=ids_b, key="chroma_best_detail_select")
+                    if selected_id_b:
+                        idx_b = ids_b.index(selected_id_b)
+                        st.text_area("Rewritten Text", value=docs_b[idx_b], height=300)
+                        st.json(metas_b[idx_b])
+        except Exception as e:
+            st.error(f"Failed to load Best Practices ChromaDB: {e}")
 
 # --------------------------------------------------------------------------
 # Main Content Branching
@@ -1844,6 +1985,9 @@ with st.container():
         st.session_state["anti_retriever"] = None
         st.session_state["optim_result"] = None
         st.session_state["optim_error"] = None
+        st.session_state["optim_session"] = None
+        st.session_state["optim_state"] = None
+        st.session_state["optim_engine"] = None
         st.session_state.pop("antithesis", None)
     else:
         file_size = getattr(uploaded_file, "size", None)
@@ -1872,6 +2016,9 @@ with st.container():
             st.session_state["anti_retriever"] = None
             st.session_state["optim_result"] = None
             st.session_state["optim_error"] = None
+            st.session_state["optim_session"] = None
+            st.session_state["optim_state"] = None
+            st.session_state["optim_engine"] = None
             st.session_state.pop("antithesis", None)
 
         if run_clicked:
@@ -2036,6 +2183,12 @@ with st.container():
                         st.session_state["optim_error"] = "empty_text"
                         st.warning(t["scan_caution"])
                     else:
+                        st.session_state["optim_result"] = None
+                        st.session_state["optim_error"] = None
+                        st.session_state["optim_state"] = None
+                        st.session_state["optim_session"] = None
+                        st.session_state["optim_engine"] = None
+
                         # Progress Callback for Overlay
                         def _optim_progress(status, step, total, score, feedback, message):
                             title = f"{t['processing_title']}"
@@ -2055,38 +2208,29 @@ with st.container():
                             )
 
                         # Actor-Critic: 주 LLM (생성) + 보조 LLM (평가)
-                        optimizer = TargetOptimizer(st.session_state["actor_provider"])
-                        result = optimizer.analyze(
+                        optimizer = TargetOptimizer(
+                            st.session_state["actor_provider"],
+                            embedding_provider=st.session_state.get("embedding_provider"),
+                        )
+                        session = optimizer.start_interactive(
                             text=text,
                             target_level=st.session_state["optim_level"],
                             progress_callback=_optim_progress,
-                            critic_provider=st.session_state["critic_provider"]
+                            critic_provider=st.session_state["critic_provider"],
                         )
-                        st.session_state["optim_result"] = result
-                        st.session_state["optim_error"] = None
+                        st.session_state["optim_session"] = session
+                        st.session_state["optim_engine"] = optimizer
 
-                        # Auto-save to RAG if score >= 95
-                        final_score = result.get("analysis", {}).get("score", 0)
-                        if final_score >= 95:
-                            st.toast(f"🏆 High Score ({final_score})! Auto-saving to RAG...", icon="💾")
-                            # Add to existing docs or create new
-                            rewritten = result.get("rewritten_text", "")
-                            if rewritten:
-                                new_doc = Document(
-                                    page_content=rewritten, 
-                                    metadata={
-                                        "source": f"Optimized: {uploaded_file.name}",
-                                        "score": final_score,
-                                        "level": st.session_state["optim_level"]
-                                    }
-                                )
-                                # Append to session docs
-                                if "anti_docs" not in st.session_state:
-                                    st.session_state["anti_docs"] = []
-                                st.session_state["anti_docs"].append(new_doc)
-                                # Invalidate index to force rebuild on next QA
-                                st.session_state["rag_index_cache"] = {} 
-                                st.session_state["anti_indexed"] = True
+                        state, done = _advance_optim_session()
+                        if done:
+                            result = optimizer.finalize_interactive(session, state)
+                            st.session_state["optim_result"] = result
+                            st.session_state["optim_error"] = None
+                            st.session_state["optim_state"] = None
+                            st.session_state["optim_session"] = None
+                            st.session_state["optim_engine"] = None
+                            _archive_optim_result(result)
+                            _append_optim_to_anti_docs(result, uploaded_file.name)
                     st.session_state["mode_last_run"] = mode_key
             except Exception:
                 logger.exception("Pipeline failed")
@@ -2231,11 +2375,56 @@ with st.container():
     if mode_key == "optim":
         optim_result = st.session_state.get("optim_result")
         optim_error = st.session_state.get("optim_error")
+        optim_state = st.session_state.get("optim_state")
         if optim_error == "pipeline_failed":
             st.warning(t["error"])
         if optim_error == "empty_text":
             st.warning(t["scan_caution"])
-        if not optim_result:
+        if optim_state and getattr(optim_state, "decision_required", False):
+            st.subheader(t["optim_decision_title"])
+            st.info(t["optim_decision_prompt"].format(score=optim_state.current_score))
+            st.subheader(t["optim_result_title"])
+            st.write(optim_state.current_text)
+
+            if getattr(optim_state, "feedback", ""):
+                with st.expander(t["optim_analysis_title"]):
+                    st.json(
+                        {
+                            "score": optim_state.current_score,
+                            "feedback": optim_state.feedback,
+                            "status": optim_state.status,
+                        }
+                    )
+
+            action_col1, action_col2 = st.columns(2)
+            accept_clicked = action_col1.button(t["optim_accept_button"])
+            retry_clicked = action_col2.button(t["optim_retry_button"])
+            if accept_clicked or retry_clicked:
+                st.session_state["is_running"] = True
+                overlay_placeholder.markdown(
+                    _processing_overlay_html(
+                        t["processing_title"], t["processing_subtitle"]
+                    ),
+                    unsafe_allow_html=True,
+                )
+                decision = "accept" if accept_clicked else "retry"
+                state, done = _advance_optim_session(decision)
+                st.session_state["is_running"] = False
+                overlay_placeholder.empty()
+                if done:
+                    optimizer = st.session_state.get("optim_engine")
+                    session = st.session_state.get("optim_session")
+                    if optimizer and session:
+                        result = optimizer.finalize_interactive(session, state)
+                        st.session_state["optim_result"] = result
+                        st.session_state["optim_error"] = None
+                        st.session_state["optim_state"] = None
+                        st.session_state["optim_session"] = None
+                        st.session_state["optim_engine"] = None
+                        _archive_optim_result(result)
+                        _append_optim_to_anti_docs(result, uploaded_file.name)
+                st.rerun()
+        elif not optim_result:
             _render_empty_state(t["no_report"])
         else:
             st.subheader(t["optim_result_title"])
