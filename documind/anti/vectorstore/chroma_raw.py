@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 
-PERSIST_DIR = str(Path(__file__).resolve().parents[1] / "chroma_raw")
+
+PERSIST_DIR = str(Path(__file__).resolve().parents[3] / "chroma_raw")
+
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 

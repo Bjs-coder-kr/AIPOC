@@ -1668,7 +1668,7 @@ def render_chroma_explorer():
     
     # Path calculation relative to this file
     # analy_app.py is in AIPOC/app/views/
-    persist_dir = str(Path(__file__).resolve().parents[2] / "chroma_raw")
+    persist_dir = str(Path(__file__).resolve().parents[3] / "chroma_raw")
     
     try:
         # ChromaDB 0.3.x style
