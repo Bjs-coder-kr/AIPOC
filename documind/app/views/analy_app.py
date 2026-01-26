@@ -72,6 +72,11 @@ I18N = {
         "upload_label": "PDF 업로드",
         "upload_info": "PDF/TXT/MD/DOCX 파일을 업로드하세요.",
         "mode_label": "분석 모드",
+        "menu_quality": "분석",
+        "menu_optim": "타겟 최적화",
+        "menu_anti": "안티테제",
+        "menu_sqlite": "SQLite 탐색기",
+        "menu_chroma": "ChromaDB 탐색기",
         "mode_quality": "품질 분석",
         "mode_anti": "문서 Q&A (OCR)",
         "mode_optim": "타깃 최적화",
@@ -840,7 +845,7 @@ logger.info(
 st.set_page_config(
     page_title="DocuMind Quality MVP",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -1601,7 +1606,7 @@ with st.sidebar:
     st.markdown("---")
     menu = st.radio(
         "Menu",
-        options=["analyzer", "sqlite", "chroma"],
+        options=["quality", "optim", "anti", "sqlite", "chroma"],
         format_func=lambda x: t.get(f"menu_{x}", x),
         label_visibility="collapsed"
     )
@@ -1754,17 +1759,12 @@ with st.container():
                 "<span id='ai-panel-marker' style='display:block;height:0;line-height:0;'></span>",
                 unsafe_allow_html=True,
             )
-            mode_labels = {
-                "quality": t["mode_quality"],
-                "anti": t["mode_anti"],
-                "optim": t["mode_optim"],
-            }
-            mode_key = st.selectbox(
-                t["mode_label"],
-                options=list(mode_labels.keys()),
-                format_func=lambda key: mode_labels[key],
-                key="analysis_mode",
-            )
+            # Mode selection is now handled by the sidebar menu
+            mode_key = menu
+            
+            # Display current mode title for clarity
+            st.subheader(t.get(f"menu_{mode_key}", mode_key))
+
             if mode_key == "quality" and ai_available:
                 ai_explain_enabled = st.toggle(
                     t["ai_explain_toggle"],
