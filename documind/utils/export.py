@@ -56,8 +56,8 @@ def create_pdf_bytes(text: str) -> bytes:
              print(f"Font not found at: {font_path}")
              raise FileNotFoundError(f"Font missing: {font_path}")
 
-        from reportlab.pdfbase.ttfonts import TTF
-        pdfmetrics.registerFont(TTF(font_name, str(font_path)))
+        from reportlab.pdfbase.ttfonts import TTFont
+        pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
     except Exception as e:
         # Fallback to CID if TTF fails
         print(f"Font loading failed: {e}")
