@@ -1872,6 +1872,30 @@ def render_chroma_explorer():
                     selected_id_b = st.selectbox("Select ID to view full content", options=ids_b, key="chroma_best_detail_select")
                     if selected_id_b:
                         idx_b = ids_b.index(selected_id_b)
+                        
+                        # Export Buttons for Best Practice
+                        from documind.utils.export import create_txt_bytes, create_pdf_bytes
+                        bp_text = docs_b[idx_b]
+                        bp_filename = f"best_practice_{ids_b[idx_b][:8]}"
+                        
+                        bp_col1, bp_col2 = st.columns(2)
+                        with bp_col1:
+                            st.download_button(
+                                label="💾 Download TXT",
+                                data=create_txt_bytes(bp_text),
+                                file_name=f"{bp_filename}.txt",
+                                mime="text/plain",
+                                key=f"bp_dl_txt_{ids_b[idx_b]}"
+                            )
+                        with bp_col2:
+                            st.download_button(
+                                label="📄 Download PDF",
+                                data=create_pdf_bytes(bp_text),
+                                file_name=f"{bp_filename}.pdf",
+                                mime="application/pdf",
+                                key=f"bp_dl_pdf_{ids_b[idx_b]}"
+                            )
+                        
                         st.text_area("Rewritten Text", value=docs_b[idx_b], height=300)
                         st.json(metas_b[idx_b])
         except Exception as e:
@@ -3203,13 +3227,51 @@ with st.container():
             else:
                 for item in history_items:
                     with st.expander(f"{item['created_at']} - {item['filename']}"):
-                        if st.button("Load Report", key=f"load_hist_{item['id']}"):
-                            detail = db_manager.get_history_detail(item["id"])
-                            if detail:
-                                # Load into session
-                                st.session_state["report"] = Report(**detail)
-                                st.success("Loaded!")
+                        # Lazy fetch detail for buttons
+                        detail = db_manager.get_history_detail(item["id"])
+                        
+                        if detail:
+                            # 1. Download Buttons (if Optim result)
+                            rewritten_text = detail.get("rewritten_text")
+                            if rewritten_text:
+                                from documind.utils.export import create_txt_bytes, create_pdf_bytes
+                                h_col1, h_col2 = st.columns(2)
+                                valid_id = item["id"]
+                                fname_base = f"optim_{valid_id}"
+                                
+                                with h_col1:
+                                    st.download_button(
+                                        label="💾 Download TXT",
+                                        data=create_txt_bytes(rewritten_text),
+                                        file_name=f"{fname_base}.txt",
+                                        mime="text/plain",
+                                        key=f"hist_dl_txt_{valid_id}"
+                                    )
+                                with h_col2:
+                                    st.download_button(
+                                        label="📄 Download PDF",
+                                        data=create_pdf_bytes(rewritten_text),
+                                        file_name=f"{fname_base}.pdf",
+                                        mime="application/pdf",
+                                        key=f"hist_dl_pdf_{valid_id}"
+                                    )
+                            
+                            # 2. Load Report Button (Existing Logic)
+                            if st.button("Load Report Context", key=f"load_hist_{item['id']}"):
+                                # We need to handle both Report objects and Optim results
+                                # Optim results are dicts, Quality reports are Report objects.
+                                # Current logic assumed Quality Report only.
+                                # Let's try to restore 'report' if it exists
+                                if "document_meta" in detail: # Likely a Report object dict
+                                    st.session_state["report"] = Report(**detail)
+                                    st.success("Analysis Report Loaded!")
+                                elif "rewritten_text" in detail: # Optim result
+                                    # Restore optim state
+                                    st.session_state["optim_result"] = detail
+                                    st.success("Optimization Result Loaded via 'Analyze' Tab!")
                                 st.rerun()
+                        else:
+                            st.warning("Failed to load details.")
         except Exception as e:
             st.error(f"Error loading history: {e}")
 
