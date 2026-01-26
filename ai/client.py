@@ -9,6 +9,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from documind.ai.embeddings import EmbeddingFactory
+
 
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_EMBED_MODEL = "text-embedding-3-small"
@@ -17,10 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIClient:
-    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None, model: str | None = None, embedding_provider: str = "OpenAI") -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.model = model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
         self.last_error: str | None = None
+        # Initialize Embedder via Factory
+        self.embedder = EmbeddingFactory.create(embedding_provider)
+        # Update OpenAIEmbedder API key if needed
+        if embedding_provider.startswith("OpenAI") and hasattr(self.embedder.provider, 'api_key'):
+             if not self.embedder.provider.api_key:
+                 self.embedder.provider.api_key = self.api_key
 
     def is_available(self) -> bool:
         return bool(self.api_key)
@@ -98,55 +106,17 @@ class OpenAIClient:
     def embed_texts(
         self, texts: list[str], model: str | None = None
     ) -> list[list[float]]:
-        if not self.is_available() or not texts:
+        if not texts:
             return []
         self.last_error = None
-        embed_model = model or os.getenv("OPENAI_EMBEDDING_MODEL", DEFAULT_EMBED_MODEL)
-        payload = {"model": embed_model, "input": texts}
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/embeddings",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
+        
+        # Delegate to CachedEmbedder
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-                parsed = json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            self.last_error = f"http_error_{exc.code}"
-            logger.warning("OpenAI embedding HTTP error status=%s", exc.code)
+            return self.embedder.embed_texts(texts, model)
+        except Exception as e:
+            self.last_error = f"embedding_failed_{e}"
+            logger.error(f"Embedding failed: {e}")
             return []
-        except urllib.error.URLError as exc:
-            self.last_error = "url_error"
-            logger.warning("OpenAI embedding URL error reason=%s", exc.reason)
-            return []
-        except json.JSONDecodeError:
-            self.last_error = "json_parse_failed"
-            logger.warning("OpenAI embedding JSON parse failed")
-            return []
-        except Exception as exc:
-            self.last_error = f"request_failed_{exc.__class__.__name__}"
-            logger.warning("OpenAI embedding request failed err=%s", exc.__class__.__name__)
-            return []
-        items = parsed.get("data") or []
-        if not isinstance(items, list):
-            self.last_error = "invalid_json"
-            return []
-        embeddings: list[list[float]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            vector = item.get("embedding")
-            if isinstance(vector, list):
-                embeddings.append([float(x) for x in vector])
-        if len(embeddings) != len(texts):
-            self.last_error = "invalid_json"
-            return []
-        return embeddings
 
     def rag_qa(
         self,

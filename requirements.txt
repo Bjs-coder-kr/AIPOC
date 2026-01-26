@@ -13,3 +13,9 @@ langchain-chroma
 langchain-community
 sentence-transformers
 chromadb
+python-docx
+pytest
+reportlab
+
+
+

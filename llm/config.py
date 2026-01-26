@@ -86,3 +86,49 @@ def get_analysis_config() -> dict:
     }
     config = LLM_CONFIG.get("analysis", {})
     return {**defaults, **config}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Available Providers (DRY - Single Source of Truth)
+# ═══════════════════════════════════════════════════════════════════
+
+AVAILABLE_PROVIDERS = [
+    "Gemini CLI",
+    "Claude CLI",
+    "Codex",
+    "Gemini API",
+    "Claude API",
+    "OpenAI API"
+]
+
+AVAILABLE_EMBEDDING_PROVIDERS = [
+    "OpenAI",
+    "Gemini",
+    "Ollama"
+]
+
+
+def get_available_providers() -> list[str]:
+    """
+    Get list of available LLM providers.
+    
+    Returns:
+        Copy of provider list to prevent external modification.
+    """
+    return AVAILABLE_PROVIDERS.copy()
+
+
+def get_available_embedding_providers() -> list[str]:
+    """Get list of available embedding providers."""
+    return AVAILABLE_EMBEDDING_PROVIDERS.copy()
+
+
+def get_default_actor_provider() -> str:
+    """Get default actor (generation) provider."""
+    return LLM_CONFIG.get("analysis", {}).get("default_provider", "Gemini CLI")
+
+
+def get_default_critic_provider() -> str:
+    """Get default critic (evaluation) provider."""
+    return "Claude CLI"  # Default to different provider for diversity
+

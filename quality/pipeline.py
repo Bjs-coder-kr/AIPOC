@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import regex as re
 
-from documind.ingest.pdf_loader import load_pdf
+from documind.ingest.loader import load_document
 from documind.profile.classify import (
     classify_pages,
     classify_text,
@@ -226,7 +226,7 @@ def run_pipeline(file_bytes: bytes, file_name: str, language: str = "ko") -> Rep
     logger = setup_logging()
     language = "en" if language == "en" else "ko"
     logger.info("LOAD")
-    loaded = load_pdf(file_bytes, file_name)
+    loaded = load_document(file_bytes, file_name)
 
     logger.info("NORMALIZE")
     normalized = normalize_pages(loaded["pages"])

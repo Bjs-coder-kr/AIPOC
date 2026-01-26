@@ -12,12 +12,35 @@ from pathlib import Path
 import regex as re
 import streamlit as st
 
+# --------------------------------------------------------------------------
+# Hotfix for ChromaDB < 0.4.0 compatibility with Pydantic v2
+# --------------------------------------------------------------------------
+import os
+# Set dummy environment variables to bypass pydantic validation in chromadb 0.3.23
+os.environ.setdefault("CLICKHOUSE_HOST", "localhost")
+os.environ.setdefault("CLICKHOUSE_PORT", "8123")
+os.environ.setdefault("CHROMA_SERVER_HOST", "localhost")
+os.environ.setdefault("CHROMA_SERVER_HTTP_PORT", "8000")
+os.environ.setdefault("CHROMA_SERVER_GRPC_PORT", "50051")
+
+try:
+    import pydantic
+    if int(pydantic.VERSION.split('.')[0]) >= 2:
+        from pydantic_settings import BaseSettings
+        pydantic.BaseSettings = BaseSettings
+except ImportError:
+    pass
+# --------------------------------------------------------------------------
+
+
 
 from documind.ai.candidates import CandidateLimiter, extract_ai_candidate
 from documind.ai.client import OpenAIClient
 from documind.ai.redact import redact_text, truncate_text
-from documind.ingest.pdf_loader import PARTIAL_SCAN_THRESHOLD, load_pdf
-from documind.llm.config import get_analysis_config
+from documind.ingest.pdf_loader import PARTIAL_SCAN_THRESHOLD
+from documind.ingest.loader import load_document
+from documind.llm.config import get_analysis_config, get_available_providers, get_available_embedding_providers, get_default_actor_provider, get_default_critic_provider
+from documind.utils.db import db_manager
 from documind.profile.classify import (
     classify_pages,
     classify_text,
@@ -45,13 +68,16 @@ I18N = {
     "ko": {
         "language_label": "언어",
         "title": "DocuMind 품질 MVP",
+        "tab_history": "분석 이력",
         "upload_label": "PDF 업로드",
-        "upload_info": "PDF/TXT/MD 파일을 업로드하세요.",
+        "upload_info": "PDF/TXT/MD/DOCX 파일을 업로드하세요.",
         "mode_label": "분석 모드",
         "mode_quality": "품질 분석",
         "mode_anti": "문서 Q&A (OCR)",
         "mode_optim": "타깃 최적화",
         "optim_provider_label": "LLM 제공자",
+        "actor_provider_label": "주 LLM (문서 생성)",
+        "critic_provider_label": "보조 LLM (평가/채점)",
         "optim_level_label": "대상",
         "optim_result_title": "최적화 결과",
         "optim_analysis_title": "분석",
@@ -195,6 +221,28 @@ I18N = {
 </ul>""",
         "quick_guide_caption": "NOTE는 기본 숨김입니다. 필요 시 '참고 포함' 토글을 켜세요.",
         "help_content": """### 지원 범위\n- 업로드 파일: PDF/TXT/MD\n- OCR 미지원: 스캔 PDF는 텍스트가 적어 결과 신뢰도가 낮아질 수 있습니다.\n\n### 개인정보 주의\n- 이슈 evidence에 원문 일부가 포함됩니다. 민감 정보가 있으면 공유/보관에 주의하세요.\n\n### 결과 해석\n- document_profile: 문서 유형 추정 결과 (dominant_type 포함)\n- score_confidence: 텍스트 추출량/스캔 여부 기반 신뢰도\n- kind/subtype: NOTE/WARNING 구분 및 세부 유형(BOILERPLATE_REPEAT/INCONSISTENCY 등)\n\n### 용어 사전 (Glossary)\n- kind: 이슈 레벨 (오류/경고/참고)\n- subtype: 세부 유형 (긴 문장/정형 문구 반복/표현 불일치 등)\n- page_type: 페이지 유형 (이력/동의/약관/일반/불확실)\n\n### 현 버전 한계\n- 맞춤법은 제한적 룰 기반이며, 문법/논리 진단은 미완입니다.""",
+        # Auth
+        "login_title": "로그인",
+        "signup_title": "회원가입",
+        "username_label": "아이디",
+        "password_label": "비밀번호",
+        "login_button": "로그인",
+        "signup_button": "가입하기",
+        "logout_button": "로그아웃",
+        "welcome_msg": "환영합니다, {username}님! ({role})",
+        "login_success": "로그인 성공!",
+        "login_failed": "로그인 실패: 아이디 또는 비밀번호를 확인하세요.",
+        "signup_success": "회원가입 성공! 이제 로그인해주세요.",
+        "signup_failed": "회원가입 실패: 이미 존재하는 아이디일 수 있습니다.",
+        "auth_required": "앱을 사용하려면 로그인이 필요합니다.",
+        "menu_analyzer": "분석기 (Analyzer)",
+        "menu_sqlite": "SQLite 탐색기",
+        "menu_chroma": "ChromaDB 탐색기",
+        "db_explorer_title": "데이터베이스 탐색기",
+        "doc_filename": "파일명",
+        "doc_user": "사용자",
+        "doc_date": "분석 일시",
+        "rag_content": "정제된 RAG 텍스트",
     },
     "en": {
         "language_label": "Language",
@@ -206,6 +254,8 @@ I18N = {
         "mode_anti": "Document Q&A (OCR)",
         "mode_optim": "Target Optimization",
         "optim_provider_label": "LLM Provider",
+        "actor_provider_label": "Actor LLM (Generation)",
+        "critic_provider_label": "Critic LLM (Evaluation)",
         "optim_level_label": "Target",
         "optim_result_title": "Optimized Result",
         "optim_analysis_title": "Analysis",
@@ -338,21 +388,45 @@ I18N = {
         "tab_issues": "Issues",
         "tab_diagnostics": "Diagnostics",
         "tab_download": "Download",
+        "tab_history": "History",
         "tab_help": "Guide/Help",
         "quick_guide_title": "Quick Guide",
         "quick_guide_body": """<ul>
-<li>Supported files: PDF/TXT/MD</li>
+<li>Supported files: PDF/TXT/MD/DOCX</li>
 <li>OCR not supported (scanned PDFs may have little text)</li>
 <li>Privacy caution: evidence includes snippets of original text</li>
 <li>Terms: <code>kind</code>=level, <code>subtype</code>=detail, <code>page_type</code>=page category</li>
 <li>Current limits: spelling is limited rule-based; grammar/logic checks are not implemented</li>
 </ul>""",
         "quick_guide_caption": "NOTE is hidden by default. Enable 'Include NOTE' if needed.",
-        "help_content": """### Scope\n- Supported file: PDF/TXT/MD\n- OCR not supported: scanned PDFs may reduce confidence.\n\n### Privacy\n- Evidence includes original text snippets. Handle sensitive data carefully.\n\n### How to read results\n- document_profile: estimated document type (includes dominant_type)\n- score_confidence: confidence based on text extraction/scan likelihood\n- kind/subtype: NOTE/WARNING and detailed types (BOILERPLATE_REPEAT/INCONSISTENCY)\n\n### Glossary\n- kind: issue level (ERROR/WARNING/NOTE)\n- subtype: detailed type (LONG_SENTENCE/BOILERPLATE_REPEAT/INCONSISTENCY)\n- page_type: page category (RESUME/CONSENT/TERMS/GENERIC/UNCERTAIN)\n\n### Current limitations\n- Spelling is limited rule-based; grammar/logic checks are not implemented.""",
+        "help_content": """### Scope\n- Supported file: PDF/TXT/MD/DOCX\n- OCR not supported: scanned PDFs may reduce confidence.\n\n### Privacy\n- Evidence includes original text snippets. Handle sensitive data carefully.\n\n### How to read results\n- document_profile: estimated document type (includes dominant_type)\n- score_confidence: confidence based on text extraction/scan likelihood\n- kind/subtype: NOTE/WARNING and detailed types (BOILERPLATE_REPEAT/INCONSISTENCY)\n\n### Glossary\n- kind: issue level (ERROR/WARNING/NOTE)\n- subtype: detailed type (LONG_SENTENCE/BOILERPLATE_REPEAT/INCONSISTENCY)\n- page_type: page category (RESUME/CONSENT/TERMS/GENERIC/UNCERTAIN)\n\n### Current limitations\n- Spelling is limited rule-based; grammar/logic checks are not implemented.""",
+        # Auth
+        "login_title": "Login",
+        "signup_title": "Sign Up",
+        "username_label": "Username",
+        "password_label": "Password",
+        "login_button": "Login",
+        "signup_button": "Sign Up",
+        "logout_button": "Logout",
+        "welcome_msg": "Welcome, {username}! ({role})",
+        "login_success": "Login successful!",
+        "login_failed": "Login failed: Check username or password.",
+        "signup_success": "Registration successful! Please login.",
+        "signup_failed": "Registration failed: Username may already exist.",
+        "auth_required": "Authentication required.",
+        # DB Explorer
+        "menu_analyzer": "Analyzer",
+        "menu_sqlite": "SQLite Explorer",
+        "menu_chroma": "ChromaDB Explorer",
+        "db_explorer_title": "Database Explorer",
+        "doc_filename": "Filename",
+        "doc_user": "User",
+        "doc_date": "Analysis Date",
+        "rag_content": "Refined RAG Content",
     },
 }
 
-SUPPORTED_FILE_TYPES = ["pdf", "txt", "md"]
+SUPPORTED_FILE_TYPES = ["pdf", "txt", "md", "docx"]
 TEXT_FILE_TYPES = {"txt", "md"}
 SCAN_LIKE_THRESHOLD = 0.6
 MIN_TEXT_LEN = 50
@@ -773,6 +847,12 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 if "lang" not in st.session_state:
     st.session_state["lang"] = "ko"
+if "auth_status" not in st.session_state:
+    st.session_state["auth_status"] = False
+if "username" not in st.session_state:
+    st.session_state["username"] = None
+if "role" not in st.session_state:
+    st.session_state["role"] = None
 if "report" not in st.session_state:
     st.session_state["report"] = None
 if "page_char_counts" not in st.session_state:
@@ -821,6 +901,19 @@ if "optim_provider" not in st.session_state:
     st.session_state["optim_provider"] = default_provider
 if "optim_level" not in st.session_state:
     st.session_state["optim_level"] = "public"
+    
+# Initialize Settings from DB
+if "actor_provider" not in st.session_state:
+    saved = db_manager.get_setting("actor_provider")
+    st.session_state["actor_provider"] = saved if saved else get_default_actor_provider()
+
+if "critic_provider" not in st.session_state:
+    saved = db_manager.get_setting("critic_provider")
+    st.session_state["critic_provider"] = saved if saved else get_default_critic_provider()
+
+if "embedding_provider" not in st.session_state:
+    saved = db_manager.get_setting("embedding_provider")
+    st.session_state["embedding_provider"] = saved if saved else "OpenAI"
 if "optim_result" not in st.session_state:
     st.session_state["optim_result"] = None
 if "optim_error" not in st.session_state:
@@ -1264,6 +1357,8 @@ def _run_rag_qa(
     language: str,
     scan_level: str,
     status_callback=None,
+    user_filter: str | None = None,
+    is_admin: bool = False,
 ) -> dict | None:
     if not question.strip() or not rag_index:
         return None
@@ -1273,7 +1368,13 @@ def _run_rag_qa(
     if not query_embeddings:
         return None
     query_embedding = query_embeddings[0]
-    chunks = search_index(rag_index, query_embedding, top_k=top_k)
+    chunks = search_index(
+        rag_index, 
+        query_embedding, 
+        top_k=top_k, 
+        user_filter=user_filter, 
+        is_admin=is_admin
+    )
     if not chunks:
         return None
     context = build_context(chunks)
@@ -1449,6 +1550,190 @@ with header_right:
     )
 
 t = I18N.get(lang, I18N["ko"])
+
+# --------------------------------------------------------------------------
+# Authentication Check
+# --------------------------------------------------------------------------
+def login_screen():
+    st.markdown("---")
+    tab1, tab2 = st.tabs([t["login_title"], t["signup_title"]])
+    
+    with tab1:
+        with st.form("login_form"):
+            username = st.text_input(t["username_label"])
+            password = st.text_input(t["password_label"], type="password")
+            submit = st.form_submit_button(t["login_button"])
+            
+            if submit:
+                user = db_manager.authenticate_user(username, password)
+                if user:
+                    st.session_state["auth_status"] = True
+                    st.session_state["username"] = user["username"]
+                    st.session_state["role"] = user["role"]
+                    st.success(t["login_success"])
+                    st.rerun()
+                else:
+                    st.error(t["login_failed"])
+    
+    with tab2:
+        with st.form("signup_form"):
+            new_user = st.text_input(t["username_label"], key="new_user")
+            new_pass = st.text_input(t["password_label"], type="password", key="new_pass")
+            submit_signup = st.form_submit_button(t["signup_button"])
+            
+            if submit_signup:
+                if db_manager.register_user(new_user, new_pass):
+                    st.success(t["signup_success"])
+                else:
+                    st.error(t["signup_failed"])
+
+if not st.session_state.get("auth_status"):
+    login_screen()
+    st.stop()
+
+# Logout Button and Welcome Message in Sidebar
+with st.sidebar:
+    st.write(t["welcome_msg"].format(username=st.session_state["username"], role=st.session_state["role"]))
+    
+    # --------------------------------------------------------------------------
+    # Sidebar Navigation Menu
+    # --------------------------------------------------------------------------
+    st.markdown("---")
+    menu = st.radio(
+        "Menu",
+        options=["analyzer", "sqlite", "chroma"],
+        format_func=lambda x: t.get(f"menu_{x}", x),
+        label_visibility="collapsed"
+    )
+    
+    st.markdown("---")
+    if st.button(t["logout_button"]):
+        st.session_state["auth_status"] = False
+        st.session_state["username"] = None
+        st.session_state["role"] = None
+        st.rerun()
+
+# --------------------------------------------------------------------------
+# DB Explorer UI Functions
+# --------------------------------------------------------------------------
+def render_sqlite_explorer():
+    st.header(t["menu_sqlite"])
+    username = st.session_state["username"]
+    is_admin = (st.session_state["role"] == "admin")
+    
+    # Tabs for History and Users (Admin only)
+    tabs = ["Analysis History"]
+    if is_admin:
+        tabs.append("User List")
+    
+    selected_tab = st.radio("Select View", tabs, horizontal=True, label_visibility="collapsed")
+    st.markdown("---")
+
+    if selected_tab == "Analysis History":
+        st.subheader("Analysis History")
+        history = db_manager.get_user_history(username, is_admin=is_admin, limit=100)
+        if not history:
+            st.info("No data in SQLite history.")
+        else:
+            import pandas as pd
+            df = pd.DataFrame(history)
+            # Rename columns for localized display if needed
+            cols = {
+                "id": "ID",
+                "filename": t["doc_filename"],
+                "user_id": t["doc_user"],
+                "created_at": t["doc_date"]
+            }
+            df = df.rename(columns=cols)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            
+    elif selected_tab == "User List" and is_admin:
+        st.subheader("Registered Users")
+        users = db_manager.get_all_users()
+        if not users:
+            st.info("No users found.")
+        else:
+            import pandas as pd
+            df = pd.DataFrame(users)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+def render_chroma_explorer():
+    st.header(t["menu_chroma"])
+    username = st.session_state["username"]
+    is_admin = (st.session_state["role"] == "admin")
+    
+    import chromadb
+    from chromadb.config import Settings
+    from pathlib import Path
+    
+    # Path calculation relative to this file
+    # analy_app.py is in AIPOC/app/views/
+    persist_dir = str(Path(__file__).resolve().parents[2] / "chroma_raw")
+    
+    try:
+        # ChromaDB 0.3.x style
+        client = chromadb.Client(Settings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=persist_dir
+        ))
+        
+        # 0.3.x does not support list_collections easily or it might vary.
+        # But we know we used 'langchain' in save_raw_docs.
+        # Let's try to get 'langchain' directly.
+        try:
+            collection = client.get_collection(name="langchain")
+        except Exception:
+             st.info("No 'langchain' collection found in ChromaDB.")
+             return
+
+        # ChromaDB query with filtering
+        if is_admin:
+            results = collection.get() # Admin sees all
+        else:
+            results = collection.get(where={"user_id": username})
+            
+        if not results or not results.get("documents"):
+            st.info("No data in ChromaDB for current user.")
+        else:
+            docs = results["documents"]
+            metas = results["metadatas"]
+            ids = results["ids"]
+            
+            display_data = []
+            for i in range(len(docs)):
+                m = metas[i] or {}
+                display_data.append({
+                    "ID": ids[i],
+                    t["doc_filename"]: m.get("source", m.get("filename", "N/A")),
+                    "Page": m.get("page", "N/A"),
+                    t["doc_user"]: m.get("user_id", "N/A"),
+                    t["rag_content"]: docs[i][:200] + "..." if len(docs[i]) > 200 else docs[i]
+                })
+            
+            import pandas as pd
+            df = pd.DataFrame(display_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            # Detail view
+            st.subheader("Detail View")
+            selected_id = st.selectbox("Select ID to view full content", options=ids, key="chroma_detail_select")
+            if selected_id:
+                idx = ids.index(selected_id)
+                st.text_area("Full Content", value=docs[idx], height=300)
+    except Exception as e:
+        st.error(f"Failed to load ChromaDB: {e}")
+
+# --------------------------------------------------------------------------
+# Main Content Branching
+# --------------------------------------------------------------------------
+if menu == "sqlite":
+    render_sqlite_explorer()
+    st.stop()
+elif menu == "chroma":
+    render_chroma_explorer()
+    st.stop()
+
+# menu == "analyzer" continues below...
 overlay_placeholder = st.empty()
 if st.session_state["is_running"]:
     overlay_placeholder.markdown(
@@ -1499,30 +1784,50 @@ with st.container():
                 ai_explain_enabled = False
                 ai_review_enabled = False
             if mode_key == "optim":
-                provider_options = [
-                    "Gemini CLI",
-                    "Claude CLI",
-                    "Codex",
-                    "Gemini API",
-                    "Claude API",
-                    "OpenAI API",
-                ]
-                if default_provider not in provider_options:
-                    provider_options.insert(0, default_provider)
-                if st.session_state["optim_provider"] not in provider_options:
-                    st.session_state["optim_provider"] = provider_options[0]
+                # DRY: 중앙 집중화된 프로바이더 목록 사용
+                provider_options = get_available_providers()
+                
+                # 주/보조 LLM 선택 (Actor-Critic 분리)
+                llm_col1, llm_col2 = st.columns(2)
+                with llm_col1:
+                    st.selectbox(
+                        t["actor_provider_label"],
+                        options=provider_options,
+                        key="actor_provider",
+                        help="문서 생성/재작성을 담당" if st.session_state.get("lang") == "ko" else "Generates/rewrites content"
+                    )
+                with llm_col2:
+                    st.selectbox(
+                        t["critic_provider_label"],
+                        options=provider_options,
+                        key="critic_provider",
+                        help="평가/채점을 담당" if st.session_state.get("lang") == "ko" else "Evaluates and scores"
+                    )
+                
+                # Embedding Provider Selection
+                embed_options = get_available_embedding_providers()
                 st.selectbox(
-                    t["optim_provider_label"],
-                    options=provider_options,
-                    key="optim_provider",
+                    "임베딩 모델" if st.session_state.get("lang") == "ko" else "Embedding Model",
+                    options=embed_options,
+                    key="embedding_provider",
+                    help="RAG 및 분석에 사용될 임베딩 모델"
                 )
+                
+                # Save settings when changed (using callback would be better but simple logic here)
+                if st.session_state["actor_provider"]:
+                    db_manager.save_setting("actor_provider", st.session_state["actor_provider"])
+                if st.session_state["critic_provider"]:
+                    db_manager.save_setting("critic_provider", st.session_state["critic_provider"])
+                if st.session_state["embedding_provider"]:
+                    db_manager.save_setting("embedding_provider", st.session_state["embedding_provider"])
+
                 st.selectbox(
                     t["optim_level_label"],
                     options=["public", "student", "worker", "expert"],
                     key="optim_level",
                 )
         with action_col:
-            run_clicked = st.button(t["analyze_button"], width="stretch")
+            run_clicked = st.button(t["analyze_button"])
 
     if uploaded_file is None:
         st.session_state["file_info"] = None
@@ -1602,7 +1907,7 @@ with st.container():
                         uploaded_file.name,
                         language=lang,
                     )
-                    loaded = load_pdf(file_bytes, uploaded_file.name)
+                    loaded = load_document(file_bytes, uploaded_file.name)
                     normalized = normalize_pages(loaded["pages"])
                     page_char_counts = [
                         {
@@ -1692,6 +1997,8 @@ with st.container():
                 elif mode_key == "anti":
                     from documind.anti.ingest.pdf_loader import load_pdf_with_ocr
                     from documind.anti.ingest.splitter import split_docs
+                    from documind.ingest.loader import load_document
+                    from langchain_core.documents import Document
                     import pytesseract
 
                     tesseract_ok = True
@@ -1700,23 +2007,36 @@ with st.container():
                     except Exception:
                         tesseract_ok = False
 
-                    if not tesseract_ok:
+                    lower_name = uploaded_file.name.lower()
+                    if not tesseract_ok and lower_name.endswith(".pdf"):
                         st.session_state["anti_error"] = "tesseract_missing"
                         st.session_state["anti_indexed"] = False
                         st.session_state["anti_docs"] = None
                         st.session_state["anti_chunks"] = None
                     else:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                            tmp.write(file_bytes)
-                            tmp_path = tmp.name
-                        docs = load_pdf_with_ocr(tmp_path)
+                        docs = []
+                        if lower_name.endswith(".pdf"):
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                                tmp.write(file_bytes)
+                                tmp_path = tmp.name
+                            docs = load_pdf_with_ocr(tmp_path)
+                        else:
+                            # TXT/MD/DOCX -> Unified Loader -> Document
+                            loaded = load_document(file_bytes, uploaded_file.name)
+                            for p in loaded["pages"]:
+                                if p["text"].strip():
+                                    docs.append(Document(
+                                        page_content=p["text"],
+                                        metadata={"page": p["page_number"], "source": uploaded_file.name}
+                                    ))
+                            
                         chunks = split_docs(docs)
                         st.session_state["anti_docs"] = docs
                         st.session_state["anti_chunks"] = chunks
                         st.session_state["anti_indexed"] = True
                         st.session_state["anti_error"] = None
                 else:
-                    loaded = load_pdf(file_bytes, uploaded_file.name)
+                    loaded = load_document(file_bytes, uploaded_file.name)
                     normalized = normalize_pages(loaded["pages"])
                     text = "\n\n".join(
                         page["text"] for page in normalized["pages"] if page["text"].strip()
@@ -1725,13 +2045,58 @@ with st.container():
                         st.session_state["optim_error"] = "empty_text"
                         st.warning(t["scan_caution"])
                     else:
-                        optimizer = TargetOptimizer(st.session_state["optim_provider"])
-                        st.session_state["optim_result"] = optimizer.analyze(
+                        # Progress Callback for Overlay
+                        def _optim_progress(status, step, total, score, feedback, message):
+                            title = f"{t['processing_title']}"
+                            if total > 0:
+                                title += f" ({step}/{total})"
+                            
+                            subtitle_parts = []
+                            if message:
+                                subtitle_parts.append(message)
+                            if score:
+                                subtitle_parts.append(f"<b>Score: {score}</b>")
+                            
+                            subtitle = " <br> ".join(subtitle_parts)
+                            overlay_placeholder.markdown(
+                                _processing_overlay_html(title, subtitle),
+                                unsafe_allow_html=True,
+                            )
+
+                        # Actor-Critic: 주 LLM (생성) + 보조 LLM (평가)
+                        optimizer = TargetOptimizer(st.session_state["actor_provider"])
+                        result = optimizer.analyze(
                             text=text,
                             target_level=st.session_state["optim_level"],
+                            progress_callback=_optim_progress,
+                            critic_provider=st.session_state["critic_provider"]
                         )
+                        st.session_state["optim_result"] = result
                         st.session_state["optim_error"] = None
-                st.session_state["mode_last_run"] = mode_key
+
+                        # Auto-save to RAG if score >= 95
+                        final_score = result.get("analysis", {}).get("score", 0)
+                        if final_score >= 95:
+                            st.toast(f"🏆 High Score ({final_score})! Auto-saving to RAG...", icon="💾")
+                            # Add to existing docs or create new
+                            rewritten = result.get("rewritten_text", "")
+                            if rewritten:
+                                new_doc = Document(
+                                    page_content=rewritten, 
+                                    metadata={
+                                        "source": f"Optimized: {uploaded_file.name}",
+                                        "score": final_score,
+                                        "level": st.session_state["optim_level"]
+                                    }
+                                )
+                                # Append to session docs
+                                if "anti_docs" not in st.session_state:
+                                    st.session_state["anti_docs"] = []
+                                st.session_state["anti_docs"].append(new_doc)
+                                # Invalidate index to force rebuild on next QA
+                                st.session_state["rag_index_cache"] = {} 
+                                st.session_state["anti_indexed"] = True
+                    st.session_state["mode_last_run"] = mode_key
             except Exception:
                 logger.exception("Pipeline failed")
                 if mode_key == "anti" and st.session_state.get("anti_error"):
@@ -1739,10 +2104,33 @@ with st.container():
                 else:
                     st.error(t["error"])
                 if mode_key == "anti":
+                    # DB Save for Anti mode (if chunks exist)
+                    chunks = st.session_state.get("anti_chunks")
+                    if chunks and uploaded_file and st.session_state.get("file_hash"):
+                         try:
+                            # Save basic info that anti-analysis was done
+                            anti_report = {
+                                "mode": "anti",
+                                "chunk_count": len(chunks),
+                                "status": "indexed"
+                            }
+                            db_manager.save_history_with_user(
+                                f"[ANTI] {uploaded_file.name}",
+                                st.session_state["file_hash"],
+                                anti_report,
+                                st.session_state["username"]
+                            )
+                         except Exception as e:
+                            logger.error(f"Failed to save anti history: {e}")
+
                     if not st.session_state.get("anti_error"):
                         st.session_state["anti_error"] = "pipeline_failed"
                     st.session_state["anti_indexed"] = False
                 if mode_key == "optim":
+                    # DB Save for Optim mode is handled inside process_optim_mode usually, 
+                    # but if it failed here, we might not save. 
+                    # If success, it should be saved where result is generated.
+                    # See below for success case handling.
                     st.session_state["optim_error"] = "pipeline_failed"
             finally:
                 st.session_state["is_running"] = False
@@ -1755,6 +2143,18 @@ with st.container():
                 st.session_state["ai_candidates"] = ai_candidates
                 st.session_state["ai_status"] = ai_status
                 st.session_state["ai_errors"] = ai_errors
+                
+                # Save Analysis History to DB
+                if uploaded_file and st.session_state.get("file_hash"):
+                    try:
+                        db_manager.save_history_with_user(
+                            uploaded_file.name,
+                            st.session_state["file_hash"],
+                            report.model_dump(),
+                            st.session_state["username"]
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to save history: {e}")
 
     if mode_key == "anti":
         anti_docs = st.session_state.get("anti_docs") or []
@@ -1849,10 +2249,115 @@ with st.container():
         else:
             st.subheader(t["optim_result_title"])
             st.write(optim_result.get("rewritten_text", ""))
+            
+            # Download Section
+            st.markdown("---")
+            st.caption("결과 다운로드")
+            
+            from documind.utils.export import create_txt_bytes, create_docx_bytes, create_pdf_bytes, create_zip_bytes
+            
+            out_text = optim_result.get("rewritten_text", "")
+            base_name = f"optimized_{uploaded_file.name.rsplit('.', 1)[0]}"
+            
+            d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+            
+            with d_col1:
+                st.download_button(
+                    label="TXT",
+                    data=create_txt_bytes(out_text),
+                    file_name=f"{base_name}.txt",
+                    mime="text/plain"
+                )
+            with d_col2:
+                st.download_button(
+                    label="DOCX",
+                    data=create_docx_bytes(out_text),
+                    file_name=f"{base_name}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            with d_col3:
+                st.download_button(
+                    label="PDF",
+                    data=create_pdf_bytes(out_text),
+                    file_name=f"{base_name}.pdf",
+                    mime="application/pdf"
+                )
+            with d_col4:
+                # ALL (ZIP)
+                all_files = {
+                    f"{base_name}.txt": create_txt_bytes(out_text),
+                    f"{base_name}.docx": create_docx_bytes(out_text),
+                    f"{base_name}.pdf": create_pdf_bytes(out_text),
+                }
+                st.download_button(
+                    label="ALL (ZIP)",
+                    data=create_zip_bytes(all_files),
+                    file_name=f"{base_name}.zip",
+                    mime="application/zip",
+                    type="primary"
+                )
+
+
+            # Save Optim History to DB
+            if optim_result and uploaded_file and st.session_state.get("file_hash"):
+                 try:
+                    # Avoid duplicated saving by checking session flag or rely on DB constraint (if any)
+                    # For now, simple save.
+                    optim_report = {
+                        "mode": "optim",
+                        "score": optim_result.get("analysis", {}).get("score"),
+                        "result_keys": list(optim_result.keys())
+                    }
+                    # We might want to store the full result if it's not too huge, 
+                    # but 'optimization' result can be large. Let's store truncated or essential parts.
+                    # Or just store the full thing as JSON.
+                    # SQLite TEXT limit is huge, so it's fine.
+                    full_report_to_save = {
+                        "mode": "optim",
+                        "result": optim_result
+                    }
+                    
+                    # We should check if we already saved this run
+                    save_key = f"optim_saved_{st.session_state['file_hash']}_{st.session_state['optim_level']}"
+                    if not st.session_state.get(save_key):
+                        db_manager.save_history_with_user(
+                            f"[OPTIM] {uploaded_file.name}",
+                            st.session_state["file_hash"],
+                            full_report_to_save,
+                            st.session_state["username"]
+                        )
+                        st.session_state[save_key] = True
+                 except Exception as e:
+                    logger.error(f"Failed to save optim history: {e}")
+
             analysis = optim_result.get("analysis")
+            score_suffix = ""
+            if analysis and "score" in analysis:
+                score_suffix = f" (Score: {analysis['score']})"
+            
             if analysis:
-                with st.expander(t["optim_analysis_title"]):
+                with st.expander(f"{t['optim_analysis_title']}{score_suffix}"):
                     st.json(analysis)
+            
+            # Diff View
+            original = optim_result.get("original_text", "")
+            rewritten = optim_result.get("rewritten_text", "")
+            if original and rewritten:
+                with st.expander(t.get("optim_diff_title", "변경 사항 비교 (Diff)") + score_suffix):
+                    import difflib
+                    diff = difflib.unified_diff(
+                        original.splitlines(),
+                        rewritten.splitlines(),
+                        fromfile='Original',
+                        tofile='Optimized',
+                        lineterm=''
+                    )
+                    diff_text = "\n".join(list(diff))
+                    if diff_text:
+                        st.code(diff_text, language="diff")
+                    else:
+                        st.info("변경 사항이 없습니다." if lang == "ko" else "No changes.")
+
             keywords = optim_result.get("keywords") or []
             if keywords:
                 st.caption(t["optim_keywords_label"])
@@ -1874,13 +2379,14 @@ with st.container():
             if message:
                 st.info(message)
 
-    summary_tab, issues_tab, diagnostics_tab, qa_tab, download_tab, help_tab = st.tabs(
+    summary_tab, issues_tab, diagnostics_tab, qa_tab, download_tab, history_tab, help_tab = st.tabs(
         [
             t["tab_summary"],
             t["tab_issues"],
             t["tab_diagnostics"],
             t["tab_qa"],
             t["tab_download"],
+            t.get("tab_history", "History"),
             t["tab_help"],
         ]
     )
@@ -2042,7 +2548,7 @@ with st.container():
                 table_height = min(360, 36 * (len(table_rows) + 1))
                 st.dataframe(
                     table_rows,
-                    width="stretch",
+                    
                     hide_index=True,
                     height=table_height,
                     column_config={
@@ -2151,7 +2657,7 @@ with st.container():
                             )
                         st.dataframe(
                             ai_rows,
-                            width="stretch",
+                            
                             hide_index=True,
                             column_config={
                                 t["table_page"]: st.column_config.NumberColumn(width="small"),
@@ -2219,7 +2725,7 @@ with st.container():
                     }
                     for profile in meta.page_profiles
                 ]
-                st.dataframe(profile_rows, width="stretch", hide_index=True)
+                st.dataframe(profile_rows, hide_index=True)
 
             page_char_counts = st.session_state.get("page_char_counts") or []
             if page_char_counts:
@@ -2239,7 +2745,7 @@ with st.container():
                     }
                     for item in sorted_counts[:5]
                 ]
-                st.dataframe(rows, width="stretch", hide_index=True)
+                st.dataframe(rows, hide_index=True)
 
     with qa_tab:
         st.subheader(t["qa_title"])
@@ -2261,7 +2767,7 @@ with st.container():
             )
             ask_clicked = st.button(
                 t["qa_ask_button"],
-                width="stretch",
+                
                 disabled=st.session_state["rag_running"],
             )
             if ask_clicked:
@@ -2294,7 +2800,11 @@ with st.container():
                         rag_index = st.session_state["rag_index_cache"].get(rag_key)
                         if rag_index is None:
                             client = OpenAIClient()
-                            rag_index = build_index(client, normalized_pages)
+                            rag_index = build_index(
+                                client, 
+                                normalized_pages,
+                                user_id=st.session_state["username"]
+                            )
                             if rag_index is None:
                                 st.session_state["rag_status"] = "error"
                                 st.session_state["rag_error"] = client.last_error
@@ -2329,6 +2839,8 @@ with st.container():
                                 lang,
                                 report.document_meta.scan_level,
                                 status_callback=_rag_status,
+                                user_filter=st.session_state["username"],
+                                is_admin=(st.session_state["role"] == "admin")
                             )
                             st.session_state["rag_last_question"] = question
                             st.session_state["rag_last_result"] = result
@@ -2469,6 +2981,29 @@ with st.container():
                     file_name="report_ai.json",
                     mime="application/json",
                 )
+
+    with history_tab:
+        st.header("최근 분석 이력" if lang == "ko" else "Recent Analysis History")
+        try:
+            history_items = db_manager.get_user_history(
+                st.session_state["username"], 
+                is_admin=(st.session_state["role"] == "admin"), 
+                limit=10
+            )
+            if not history_items:
+                st.info("이력이 없습니다." if lang == "ko" else "No history found.")
+            else:
+                for item in history_items:
+                    with st.expander(f"{item['created_at']} - {item['filename']}"):
+                        if st.button("Load Report", key=f"load_hist_{item['id']}"):
+                            detail = db_manager.get_history_detail(item["id"])
+                            if detail:
+                                # Load into session
+                                st.session_state["report"] = Report(**detail)
+                                st.success("Loaded!")
+                                st.rerun()
+        except Exception as e:
+            st.error(f"Error loading history: {e}")
 
     with help_tab:
         st.markdown(t["help_content"])

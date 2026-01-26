@@ -115,12 +115,21 @@ class TargetOptimizer:
         
         merged_text = "\n\n".join(r.get("rewritten_text", "") for r in results)
         all_keywords = []
+        total_score = 0
+        valid_scores = 0
+        
         for r in results:
             all_keywords.extend(r.get("keywords", []))
+            analysis = r.get("analysis", {})
+            if isinstance(analysis, dict) and "score" in analysis:
+                total_score += analysis["score"]
+                valid_scores += 1
+        
+        avg_score = round(total_score / valid_scores) if valid_scores > 0 else 0
         
         return {
             "rewritten_text": merged_text,
-            "analysis": {"score": 5, "comment": f"Merged from {len(results)} chunks"},
+            "analysis": {"score": avg_score, "comment": f"Merged from {len(results)} chunks (Avg Score: {avg_score})"},
             "keywords": list(set(all_keywords)),
             "quizzes": []
         }
@@ -267,7 +276,7 @@ Rewrite the text following these guidelines:
 Text:
 {text}
 
-Output ONLY the rewritten text (in original language).
+Output ONLY the rewritten text (in Korean, or original language).
 """
         logger.info("⚡ [Direct] Rewriting with Actor-Critic Loop...")
         rewritten_text = generate_with_critic_loop(

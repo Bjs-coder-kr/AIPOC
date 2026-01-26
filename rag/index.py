@@ -65,10 +65,16 @@ def build_index(
     overlap: int = 120,
     batch_size: int = 32,
     embed_model: str | None = None,
+    user_id: str | None = None,
 ) -> dict | None:
     chunks = chunk_pages(pages, chunk_size=chunk_size, overlap=overlap)
     if not chunks:
         return None
+    # Add user_id to chunks
+    if user_id:
+        for chunk in chunks:
+            chunk["user_id"] = user_id
+            
     texts = [redact_text(chunk["text"]) for chunk in chunks]
     embeddings: list[list[float]] = []
     for start in range(0, len(texts), batch_size):
@@ -83,29 +89,69 @@ def build_index(
 
 
 def search_index(
-    index: dict, query_embedding: list[float], top_k: int = 4
+    index: dict, 
+    query_embedding: list[float], 
+    top_k: int = 4,
+    user_filter: str | None = None,
+    is_admin: bool = False
 ) -> list[dict]:
     chunks = index.get("chunks") or []
     embeddings = index.get("embeddings") or []
     if not chunks or not embeddings or not query_embedding:
         return []
+    
+    # Filter valid indices based on user ownership
+    valid_indices = []
+    for i, chunk in enumerate(chunks):
+        chunk_owner = chunk.get("user_id")
+        # Admin sees everything, Owner sees theirs, Public (no owner) seen by anyone
+        if is_admin or not chunk_owner or chunk_owner == user_filter:
+            valid_indices.append(i)
+            
+    if not valid_indices:
+        return []
+
     scores: list[float] = []
     page_ids: list[int] = []
-    for emb in embeddings:
+    
+    # Calculate scores only for valid chunks
+    valid_embeddings = [embeddings[i] for i in valid_indices]
+    
+    for emb in valid_embeddings:
         scores.append(_cosine_similarity(query_embedding, emb))
-    for chunk in chunks:
-        page_ids.append(int(chunk.get("page", chunk.get("page_number", 0))))
-    scored = sorted(range(len(chunks)), key=lambda idx: scores[idx], reverse=True)
-    if not scored:
+    
+    for i in valid_indices:
+         chunk = chunks[i]
+         page_ids.append(int(chunk.get("page", chunk.get("page_number", 0))))
+
+    # Sort based on score
+    # valid_indices map to 0..len(valid_indices)-1 in scores list
+    # We need to keep track of original indices if we want to retrieve chunks later?
+    # Actually we can just work with the filtered subsets.
+    
+    scored_subset_indices = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    
+    if not scored_subset_indices:
         return []
-    pool_size = min(len(scored), max(top_k * 4, 12))
-    candidates = scored[:pool_size]
-    selected = _mmr_select(
-        embeddings, query_embedding, candidates, scores, top_k, page_ids=page_ids
+    
+    pool_size = min(len(scored_subset_indices), max(top_k * 4, 12))
+    candidates = scored_subset_indices[:pool_size]
+    
+    # Run MMR on the limited candidate set
+    candidate_embeddings = [valid_embeddings[i] for i in candidates]
+    # We need to pass full list of embeddings to MMR? No, just candidates.
+    # But MMR needs random access to embeddings[s_idx].
+    # Let's simplify: pass filtered embeddings and re-map indices.
+    
+    selected_subset_indices = _mmr_select(
+        valid_embeddings, query_embedding, candidates, scores, top_k, page_ids=page_ids
     )
+    
     results: list[dict] = []
-    for idx in selected:
-        chunk = dict(chunks[idx])
+    for idx in selected_subset_indices:
+        # idx is index in valid_indices list
+        original_idx = valid_indices[idx]
+        chunk = dict(chunks[original_idx])
         chunk["score"] = round(scores[idx], 4)
         results.append(chunk)
     return results

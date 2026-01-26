@@ -11,19 +11,43 @@ def _get_embedding():
     return SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
 def save_raw_docs(docs):
-    from langchain_chroma import Chroma
-
-    db = Chroma.from_documents(
-        docs,
-        _get_embedding(),
+    import chromadb
+    from chromadb.config import Settings
+    
+    # ChromaDB 0.3.x style persistence
+    client = chromadb.Client(Settings(
+        chroma_db_impl="duckdb+parquet",
         persist_directory=PERSIST_DIR
+    ))
+    
+    # Use 'langchain' collection to match previous behavior
+    collection = client.get_or_create_collection(name="langchain")
+    
+    texts = [doc.page_content for doc in docs]
+    metadatas = [doc.metadata for doc in docs]
+    # Simple ID generation
+    import uuid
+    ids = [str(uuid.uuid4()) for _ in docs]
+    
+    collection.add(
+        documents=texts,
+        metadatas=metadatas,
+        ids=ids
     )
-    return db
+    # Persist data explicitly if needed (0.3.x sometimes requires it)
+    try:
+        client.persist()
+    except AttributeError:
+        pass 
+        
+    return collection
 
 def get_chroma():
-    from langchain_chroma import Chroma
-
-    return Chroma(
-        persist_directory=PERSIST_DIR,
-        embedding_function=_get_embedding()
-    )
+    import chromadb
+    from chromadb.config import Settings
+    
+    client = chromadb.Client(Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=PERSIST_DIR
+    ))
+    return client
