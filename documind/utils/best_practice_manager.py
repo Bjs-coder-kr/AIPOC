@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 BEST_PRACTICE_COLLECTION_BASE = "optim_best_practices"
-BEST_PRACTICE_COLLECTION_VERSION = "v1"
+BEST_PRACTICE_COLLECTION_VERSION = "v2"
 BEST_PRACTICE_COLLECTION = (
     f"{BEST_PRACTICE_COLLECTION_BASE}_{BEST_PRACTICE_COLLECTION_VERSION}"
 )
 
-PERSIST_DIR = Path(__file__).resolve().parents[2] / "chroma_best_practices_v2"
+PERSIST_DIR = Path(__file__).resolve().parents[2] / "chroma_best_practices"
 
 _CLIENT_LOCK = threading.Lock()
 _CLIENT = None
@@ -72,11 +72,23 @@ def _get_client():
         return _CLIENT
 
 
-def _get_collection(name: str | None = None):
-    name = name or BEST_PRACTICE_COLLECTION
+def _get_collection(name: str | None = None, provider: str | None = None):
+    # If a specific name is given, use it (for explorer etc)
+    # If not, build it from the provider
+    if not name:
+        base = BEST_PRACTICE_COLLECTION
+        # Clean provider name to be safe for filenames/collection names
+        # e.g. "Gemini CLI" -> "gemini_cli", "OpenAI API" -> "openai_api"
+        # But usually we get "gemini", "openai", "ollama".
+        suffix = (provider or "default").lower().replace(" ", "_").replace("-", "_")
+        name = f"{base}_{suffix}"
+
     if name in _COLLECTION_CACHE:
         return _COLLECTION_CACHE[name]
+    
     client = _get_client()
+    # We must ensure we don't accidentally mix dimensions in the default collection if provider is missing
+    # But for now, we assume provider is passed.
     collection = client.get_or_create_collection(name=name)
     _COLLECTION_CACHE[name] = collection
     return collection
@@ -167,7 +179,7 @@ def archive_best_practice(
         logger.warning("Archive skipped: embedding failed.")
         return False
 
-    collection = _get_collection(collection_name)
+    collection = _get_collection(collection_name, provider=embedding_provider)
     try:
         collection.add(
             documents=[masked_rewritten],
@@ -195,7 +207,7 @@ def retrieve_best_practices(
         return []
 
     masked_query = _mask_pii(original_text.strip())
-    collection = _get_collection(collection_name)
+    collection = _get_collection(collection_name, provider=embedding_provider)
 
     def _get_docs(where_filter: dict | None):
         try:

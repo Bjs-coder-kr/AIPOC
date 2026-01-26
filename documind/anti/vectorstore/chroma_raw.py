@@ -4,7 +4,7 @@ from pathlib import Path
 from documind.utils.pydantic_compat import patch_pydantic_v1_for_chromadb
 
 
-PERSIST_DIR = str(Path(__file__).resolve().parents[3] / "chroma_raw_v2")
+PERSIST_DIR = str(Path(__file__).resolve().parents[3] / "chroma_raw")
 
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")

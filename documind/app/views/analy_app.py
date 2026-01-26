@@ -1773,8 +1773,8 @@ def render_chroma_explorer():
     
     # Path calculation relative to this file
     # analy_app.py is in AIPOC/app/views/
-    persist_dir_raw = str(Path(__file__).resolve().parents[3] / "chroma_raw_v2")
-    persist_dir_best = str(Path(__file__).resolve().parents[3] / "chroma_best_practices_v2")
+    persist_dir_raw = str(Path(__file__).resolve().parents[3] / "chroma_raw")
+    persist_dir_best = str(Path(__file__).resolve().parents[3] / "chroma_best_practices")
     
     tab_rag, tab_best = st.tabs(["📚 RAG Documents", "🏆 Best Practices"])
     
@@ -1820,10 +1820,26 @@ def render_chroma_explorer():
     with tab_best:
         try:
             client_best = chromadb.PersistentClient(path=persist_dir_best)
+            # Determine collection based on current provider
+            # Allow user to select which provider's DB to view (Buttons/Radio)
+            explorer_provider = st.radio(
+                "DB Provider",
+                options=get_available_embedding_providers(),
+                index=0,
+                key="bp_explorer_provider_select",
+                horizontal=True,
+                help="Select which embedding provider's database to inspect."
+            )
+            
+            suffix = (explorer_provider or "default").lower().replace(" ", "_").replace("-", "_")
+            coll_name = f"optim_best_practices_v2_{suffix}"
+            
+            st.info(f"Viewing Best Practices for Provider: **{explorer_provider}** ({coll_name})")
+            
             try:
-                collection_best = client_best.get_collection(name="optim_best_practices_v1")
+                collection_best = client_best.get_collection(name=coll_name)
             except Exception:
-                st.info("No best practices collection found. High-scoring results will appear here.")
+                st.warning(f"No collection found for {current_provider}. Try running an optimization first!")
                 collection_best = None
             
             if collection_best:
@@ -2384,19 +2400,8 @@ with st.container():
         if optim_state and getattr(optim_state, "decision_required", False):
             st.subheader(t["optim_decision_title"])
             st.info(t["optim_decision_prompt"].format(score=optim_state.current_score))
-            st.subheader(t["optim_result_title"])
-            st.write(optim_state.current_text)
-
-            if getattr(optim_state, "feedback", ""):
-                with st.expander(t["optim_analysis_title"]):
-                    st.json(
-                        {
-                            "score": optim_state.current_score,
-                            "feedback": optim_state.feedback,
-                            "status": optim_state.status,
-                        }
-                    )
-
+            
+            # Buttons moved to top
             action_col1, action_col2, action_col3 = st.columns(3)
             accept_clicked = action_col1.button(t["optim_accept_button"], type="primary")
             retry_clicked = action_col2.button(t["optim_retry_button"])
@@ -2433,6 +2438,20 @@ with st.container():
                         _archive_optim_result(result)
                         _append_optim_to_anti_docs(result, uploaded_file.name)
                 st.rerun()
+
+            st.subheader(t["optim_result_title"])
+            st.write(optim_state.current_text)
+            
+            if getattr(optim_state, "feedback", ""):
+                 with st.expander(t["optim_analysis_title"]):
+                    st.json(
+                        {
+                            "score": optim_state.current_score,
+                            "feedback": optim_state.feedback,
+                            "status": optim_state.status,
+                        }
+                    )
+
         elif not optim_result:
             _render_empty_state(t["no_report"])
         else:
