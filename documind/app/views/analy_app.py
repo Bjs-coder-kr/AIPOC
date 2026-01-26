@@ -1766,7 +1766,10 @@ def render_sqlite_explorer():
                 detail = db_manager.get_history_detail(selected_id)
                 if detail:
                     # Check if it's an optimization result with rewritten_text
-                    rewritten_text = detail.get("rewritten_text")
+                    # The data structure is: {"mode": "optim", "result": {"rewritten_text": ...}}
+                    # Or direct {"rewritten_text": ...} for older entries
+                    result_data = detail.get("result") or detail
+                    rewritten_text = result_data.get("rewritten_text")
                     if rewritten_text:
                         from documind.utils.export import create_txt_bytes, create_pdf_bytes
                         fname_base = f"sqlite_export_{selected_id}"
