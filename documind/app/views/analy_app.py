@@ -13,23 +13,19 @@ import regex as re
 import streamlit as st
 
 # --------------------------------------------------------------------------
-# Hotfix for ChromaDB < 0.4.0 compatibility with Pydantic v2
+# Hotfix for ChromaDB compatibility with Pydantic v2
 # --------------------------------------------------------------------------
 import os
-# Set dummy environment variables to bypass pydantic validation in chromadb 0.3.23
+# Set dummy environment variables to bypass chromadb validation defaults.
 os.environ.setdefault("CLICKHOUSE_HOST", "localhost")
 os.environ.setdefault("CLICKHOUSE_PORT", "8123")
 os.environ.setdefault("CHROMA_SERVER_HOST", "localhost")
 os.environ.setdefault("CHROMA_SERVER_HTTP_PORT", "8000")
 os.environ.setdefault("CHROMA_SERVER_GRPC_PORT", "50051")
 
-try:
-    import pydantic
-    if int(pydantic.VERSION.split('.')[0]) >= 2:
-        from pydantic_settings import BaseSettings
-        pydantic.BaseSettings = BaseSettings
-except ImportError:
-    pass
+from documind.utils.pydantic_compat import patch_pydantic_v1_for_chromadb
+
+patch_pydantic_v1_for_chromadb()
 # --------------------------------------------------------------------------
 
 
@@ -1668,7 +1664,6 @@ def render_chroma_explorer():
     is_admin = (st.session_state["role"] == "admin")
     
     import chromadb
-    from chromadb.config import Settings
     from pathlib import Path
     
     # Path calculation relative to this file
@@ -1676,11 +1671,7 @@ def render_chroma_explorer():
     persist_dir = str(Path(__file__).resolve().parents[3] / "chroma_raw")
     
     try:
-        # ChromaDB 0.3.x style
-        client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=persist_dir
-        ))
+        client = chromadb.PersistentClient(path=persist_dir)
         
         # 0.3.x does not support list_collections easily or it might vary.
         # But we know we used 'langchain' in save_raw_docs.

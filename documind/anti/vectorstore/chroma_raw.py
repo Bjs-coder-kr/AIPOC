@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+from documind.utils.pydantic_compat import patch_pydantic_v1_for_chromadb
+
 
 PERSIST_DIR = str(Path(__file__).resolve().parents[3] / "chroma_raw")
 
@@ -13,14 +15,10 @@ def _get_embedding():
     return SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
 def save_raw_docs(docs):
+    patch_pydantic_v1_for_chromadb()
     import chromadb
-    from chromadb.config import Settings
     
-    # ChromaDB 0.3.x style persistence
-    client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=PERSIST_DIR
-    ))
+    client = chromadb.PersistentClient(path=PERSIST_DIR)
     
     # Use 'langchain' collection to match previous behavior
     collection = client.get_or_create_collection(name="langchain")
@@ -45,11 +43,7 @@ def save_raw_docs(docs):
     return collection
 
 def get_chroma():
+    patch_pydantic_v1_for_chromadb()
     import chromadb
-    from chromadb.config import Settings
-    
-    client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=PERSIST_DIR
-    ))
-    return client
+
+    return chromadb.PersistentClient(path=PERSIST_DIR)

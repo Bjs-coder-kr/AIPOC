@@ -12,10 +12,9 @@ langchain-anthropic
 langchain-chroma
 langchain-community
 sentence-transformers
-chromadb
+chromadb>=0.4.24
 python-docx
 pytest
 reportlab
-
 
 
