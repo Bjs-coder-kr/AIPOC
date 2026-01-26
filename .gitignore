@@ -10,4 +10,8 @@ venv/
 *.db
 *.sqlite3
 .pytest_cache/
-assets/fonts/
+chroma_raw/
+codex_out.txt
+documind.db
+*.sqlite3
+
