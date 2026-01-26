@@ -91,10 +91,11 @@ I18N = {
         "optim_result_title": "최적화 결과",
         "optim_analysis_title": "분석",
         "optim_keywords_label": "키워드",
-        "optim_accept_button": "수락",
-        "optim_retry_button": "다시 시도",
-        "optim_decision_title": "사용자 확인",
-        "optim_decision_prompt": "점수가 {score}점입니다. 결과를 수락할까요?",
+        "optim_accept_button": "수락 (완료)",
+        "optim_retry_button": "1회 재시도 (수정)",
+        "optim_autorun_button": "끝까지 자동 진행 (Auto)",
+        "optim_decision_title": "사용자 확인 (점수 부족)",
+        "optim_decision_prompt": "현재 점수: {score}점 (목표: 90점 이상). 어떻게 할까요?",
         "anti_indexed": "문서 인덱싱 완료.",
         "anti_preview_title": "OCR / 텍스트 추출 결과 미리보기",
         "anti_question_label": "문서에 대해 질문하세요",
@@ -2396,10 +2397,12 @@ with st.container():
                         }
                     )
 
-            action_col1, action_col2 = st.columns(2)
-            accept_clicked = action_col1.button(t["optim_accept_button"])
+            action_col1, action_col2, action_col3 = st.columns(3)
+            accept_clicked = action_col1.button(t["optim_accept_button"], type="primary")
             retry_clicked = action_col2.button(t["optim_retry_button"])
-            if accept_clicked or retry_clicked:
+            autorun_clicked = action_col3.button(t.get("optim_autorun_button", "끝까지 자동 진행"))
+            
+            if accept_clicked or retry_clicked or autorun_clicked:
                 st.session_state["is_running"] = True
                 overlay_placeholder.markdown(
                     _processing_overlay_html(
@@ -2407,7 +2410,13 @@ with st.container():
                     ),
                     unsafe_allow_html=True,
                 )
-                decision = "accept" if accept_clicked else "retry"
+                
+                decision = "retry"
+                if accept_clicked:
+                    decision = "accept"
+                elif autorun_clicked:
+                    decision = "auto_run"
+                
                 state, done = _advance_optim_session(decision)
                 st.session_state["is_running"] = False
                 overlay_placeholder.empty()

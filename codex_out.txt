@@ -1,0 +1,36 @@
+============================ Data Preprocessing ============================
+
+# 데이터 전처리 😊  
+데이터 전처리는 요리를 시작하기 전에 재료를 손질하는 과정과 같아요! 🥕✨  
+깨끗하고 정돈된 재료가 있어야 맛있는 요리가 나오듯, 좋은 데이터가 있어야 정확한 분석과 모델이 가능해요.
+
+- 참고 자료  
+  https://velog.io/@gurumagineer/06.-데이터-전처리  
+  https://velog.io/@kimdukbae/데이터-전처리-이론-및-실습1  
+  https://m.blog.naver.com/asus1984/120088161483  
+
+# 레이블 인코딩(Label Encoding), 원-핫 인코딩(One-Hot Encoding) 🏷️  
+범주형 데이터를 숫자로 바꿔주는 방법이에요.  
+라벨 인코딩은 “빨강=0, 파랑=1”처럼 단순히 번호를 매기고,  
+원-핫 인코딩은 “빨강= [1,0,0], 파랑= [0,1,0]”처럼 각각을 따로 표시해요! 🎨
+
+- 참고 자료  
+  https://94ung.tistory.com/38  
+  범주형 데이터의 다양한 인코딩(Encoding)  
+  https://conanmoon.medium.com/데이터과학-유망주의-매일-글쓰기-일곱번째-일요일-7a40e7de39d4  
+
+# 표준화(Standardization), 정규화(Normalization) 📏  
+서로 다른 단위를 가진 데이터를 비교하기 쉽게 맞춰주는 과정이에요.  
+예를 들어 키(cm)와 몸무게(kg)를 그대로 비교하면 균형이 깨지니까,  
+같은 “스케일”로 맞춰주는 느낌이에요! ⚖️
+
+- 참고 자료  
+  https://soo-jjeong.tistory.com/123  
+  https://cutt.ly/XYjCuI1 : 데이터의 다양한 표준화 방법  
+
+# PCA (Principal Component Analysis, 주성분 분석) 🧩  
+PCA는 복잡한 데이터를 “핵심 요약본”처럼 줄여주는 기법이에요.  
+마치 긴 책을 핵심 요약만 남겨서 더 빠르게 이해하는 것과 비슷해요! 📚✨  
+
+- 참고 자료  
+  PCA.txt

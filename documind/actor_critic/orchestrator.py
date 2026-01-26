@@ -161,6 +161,7 @@ def generate_with_critic_loop(
     extra_used = False
     bonus_used = False
     attempt = 0
+    auto_run_enabled = False
 
     while attempt < total_retries:
         # 1. Generate (Actor)
@@ -293,9 +294,12 @@ def generate_with_critic_loop(
                     f"✅ Passed! ({score} >= {pass_threshold})",
                 )
         elif check_threshold <= score < pass_threshold:
-            status = "WAIT_CONFIRM"
-            decision_required = True
-            message = f"WAIT_CONFIRM ({score})"
+            if not auto_run_enabled:
+                status = "WAIT_CONFIRM"
+                decision_required = True
+                message = f"WAIT_CONFIRM ({score})"
+                # If auto_run is enabled, we treat this as a "fail" (continue refining) 
+                # effectively falling through to the retry logic below.
 
         # Warn if score dropping
         if attempt > 0 and score < history[attempt - 1]["score"]:
@@ -332,6 +336,10 @@ def generate_with_critic_loop(
                 state.decision_required = False
                 state.message = "ACCEPTED"
                 return state
+            if decision == "auto_run":
+                auto_run_enabled = True
+                decision = "retry"  # Continue as retry
+                
             if decision != "retry":
                 decision = "retry"
 
