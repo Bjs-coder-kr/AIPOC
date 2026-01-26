@@ -1,17 +1,94 @@
-
+# ------------------------------------------------------------------------------
+# 1. Python & Build Artifacts
+# ------------------------------------------------------------------------------
 __pycache__/
-*.pyc
-*.pyo
-.DS_Store
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ------------------------------------------------------------------------------
+# 2. Virtual Environments
+# ------------------------------------------------------------------------------
 .env
 .venv
 env/
 venv/
-*.db
-*.sqlite3
-.pytest_cache/
-chroma_raw/
-codex_out.txt
-documind.db
-*.sqlite3
+ENV/
+env.bak/
+venv.bak/
 
+# ------------------------------------------------------------------------------
+# 3. Testing & Coverage
+# ------------------------------------------------------------------------------
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# ------------------------------------------------------------------------------
+# 4. IDE & Editor Configs
+# ------------------------------------------------------------------------------
+.vscode/
+.idea/
+.spyderproject
+.spyproject
+.ropeproject
+*.manifest
+*.spec
+
+# ------------------------------------------------------------------------------
+# 5. OS Generated Files
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ------------------------------------------------------------------------------
+# 6. DocuMind Specific (Project Data)
+# ------------------------------------------------------------------------------
+# Local SQLite DB (User history)
+documind.db
+
+# ChromaDB Data (Legacy & Multi-Provider)
+chroma_raw/
+chroma_best_practices/
+optim_best_practices_v2_*/
+
+# Generated Artifacts (Downloads)
+optimized_*
+implementation_plan.md
+
+# Logs
+*.log
+pip-log.txt

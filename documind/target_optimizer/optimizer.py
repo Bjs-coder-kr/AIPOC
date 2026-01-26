@@ -10,15 +10,22 @@ Features:
 """
 
 import json
-import re
 import logging
+import re
+from functools import lru_cache
 
 from ..llm import call_llm
-from ..actor_critic import generate_with_critic_loop
+from ..llm.config import get_analysis_config, get_default_embedding_provider
+from ..actor_critic import generate_with_critic_loop, OptimizerState
 from .personas import get_persona, STRING_TO_ENUM, PERSONA_GUIDES, TargetPersona
 from .guardrail import TargetGuardrail
+from ..utils.best_practice_manager import retrieve_best_practices
 
 logger = logging.getLogger(__name__)
+
+MAX_EXAMPLE_TOKENS = 1000
+MAX_SINGLE_EXAMPLE_LENGTH = 500
+RECALL_SCORE_THRESHOLD = 92
 
 
 class TargetOptimizer:
@@ -31,7 +38,7 @@ class TargetOptimizer:
         print(result["rewritten_text"])
     """
     
-    def __init__(self, provider: str):
+    def __init__(self, provider: str, embedding_provider: str | None = None):
         """
         Initialize optimizer.
         
@@ -39,7 +46,13 @@ class TargetOptimizer:
             provider: LLM provider string (e.g., "Gemini CLI", "OpenAI API")
         """
         self.provider = provider
-        self.max_retries = 3
+        self.embedding_provider = embedding_provider or get_default_embedding_provider()
+        config = get_analysis_config()
+        self.max_retries = config.get("max_retries", 5)
+        self.extra_retries = config.get("extra_retries", 3)
+        self.min_score_for_extra = config.get("min_score_for_extra", 75)
+        self.pass_threshold = config.get("pass_threshold", 90)
+        self.check_threshold = config.get("check_threshold", 85)
 
     def analyze(
         self, 
@@ -47,7 +60,10 @@ class TargetOptimizer:
         target_level: str = "public", 
         progress_callback=None, 
         critic_provider=None,
-        chunk_size: int = 3000
+        chunk_size: int = 3000,
+        embedding_provider: str | None = None,
+        decision_callback=None,
+        interactive: bool = False,
     ) -> dict:
         """
         Main analysis pipeline.
@@ -58,12 +74,21 @@ class TargetOptimizer:
             progress_callback: Optional callback(stage, current, total, score, feedback, message)
             critic_provider: Optional separate LLM for critique
             chunk_size: Maximum chunk size for processing
+            embedding_provider: Optional embedding provider override for RAG examples
+            decision_callback: Optional callback(state) -> "accept" | "retry"
+            interactive: If True, disable chunking (single chunk) for UI-driven flow
         
         Returns:
             Dict with keys: rewritten_text, analysis, keywords, quizzes, original_text
         """
+        if embedding_provider:
+            self.embedding_provider = embedding_provider
+
         # Simple chunking (no external dependency)
-        chunks = self._split_text(text, chunk_size)
+        if interactive:
+            chunks = [text]
+        else:
+            chunks = self._split_text(text, chunk_size)
         chunk_results = []
         
         total_chunks = len(chunks)
@@ -81,12 +106,24 @@ class TargetOptimizer:
                 chunk_progress = make_chunk_progress(i)
 
             logger.info(f"🧩 Processing Chunk {i+1}/{total_chunks}...")
-            res = self._process_single_chunk(chunk_text, target_level, chunk_progress, critic_provider)
+            res = self._process_single_chunk(
+                chunk_text,
+                target_level,
+                chunk_progress,
+                critic_provider,
+                decision_callback=decision_callback,
+            )
             chunk_results.append(res)
             
         # Merge results
         merged = self._merge_results(chunk_results)
-        return self._ensure_defaults(merged, text, merged.get("keywords", []))
+        return self._ensure_defaults(
+            merged,
+            text,
+            merged.get("keywords", []),
+            target_level=target_level,
+            model_version=self.provider,
+        )
 
     def _split_text(self, text: str, chunk_size: int) -> list:
         """Simple text chunking by character count."""
@@ -107,6 +144,65 @@ class TargetOptimizer:
             chunks.append(text[current:end])
             current = end
         return chunks
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _count_tokens(text: str) -> int:
+        try:
+            import tiktoken
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception:
+            return max(1, len(text) // 4)
+
+    @staticmethod
+    def _truncate_example(text: str, max_len: int) -> str:
+        if not text or len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "..."
+
+    def _build_examples_block(self, original_text: str, target_level: str) -> str:
+        examples = retrieve_best_practices(
+            original_text,
+            target_level,
+            n=2,
+            embedding_provider=self.embedding_provider,
+            min_score=RECALL_SCORE_THRESHOLD,
+        )
+        if not examples:
+            return ""
+
+        blocks: list[str] = []
+        total_tokens = 0
+        for idx, ex in enumerate(examples, start=1):
+            original = self._truncate_example(ex.original_text, MAX_SINGLE_EXAMPLE_LENGTH)
+            rewritten = self._truncate_example(ex.rewritten_text, MAX_SINGLE_EXAMPLE_LENGTH)
+            if not original or not rewritten:
+                continue
+            block = (
+                f"<example_{idx}>\n"
+                f"Original: {original}\n"
+                f"Rewritten: {rewritten}\n"
+                f"</example_{idx}>"
+            )
+            block_tokens = self._count_tokens(block)
+            if total_tokens + block_tokens > MAX_EXAMPLE_TOKENS:
+                continue
+            blocks.append(block)
+            total_tokens += block_tokens
+            if len(blocks) >= 2:
+                break
+
+        if not blocks:
+            return ""
+
+        return (
+            "[Optimized Examples for Reference]\n"
+            "Do not copy the content, but follow the style and tone.\n\n"
+            + "\n\n".join(blocks)
+            + "\n"
+        )
 
     def _merge_results(self, results: list) -> dict:
         """Merge chunk results."""
@@ -134,7 +230,171 @@ class TargetOptimizer:
             "quizzes": []
         }
 
-    def _process_single_chunk(self, text: str, target_level: str, progress_callback, critic_provider=None) -> dict:
+    def start_interactive(
+        self,
+        text: str,
+        target_level: str,
+        progress_callback=None,
+        critic_provider=None,
+    ) -> dict:
+        """Prepare an interactive optimization session (single chunk)."""
+        persona_enum = STRING_TO_ENUM.get(target_level.lower(), TargetPersona.PUBLIC)
+        guide = PERSONA_GUIDES[persona_enum]
+        guardrail = TargetGuardrail()
+
+        complexity_score = self._calculate_complexity(text)
+        strategy = self._route_strategy(complexity_score, persona_enum)
+
+        if strategy == "PLAN_AND_SOLVE":
+            from ..utils.json_utils import extract_json
+
+            planner_prompt = f"""
+**[SYSTEM PROMPT]**
+You are a content strategist. Analyze the text and create a rewriting plan for audience: "{guide['role']}".
+
+**TARGET GUIDELINES:**
+- Tone: {guide['tone']}
+- Vocab: {guide['vocabulary']}
+
+**TASK:**
+Output a JSON list of rewriting actions:
+1. Identify jargon to define or replace.
+2. Identify long sentences to split.
+3. Identify abstract concepts needing analogies.
+
+**INPUT TEXT:**
+{text[:2000]}
+
+**OUTPUT FORMAT (JSON ONLY):**
+{{
+  "complexity_score": <float>,
+  "actions": [
+    {{"type": "define", "term": "...", "strategy": "..."}},
+    {{"type": "split", "target": "...", "strategy": "..."}}
+  ]
+}}
+"""
+            logger.info("🧠 [Planner] Generating Plan...")
+            plan_json_str = call_llm(self.provider, planner_prompt)
+            plan_data = extract_json(plan_json_str) or {"actions": []}
+
+            examples_block = self._build_examples_block(text, target_level)
+            prompt_template = f"""
+**[SYSTEM PROMPT]**
+You are an expert editor acting as "{guide['role']}".
+Rewrite the text adhering strictly to the plan provided.
+
+{examples_block}
+
+**INPUT DATA:**
+<original_text>
+{{text}}
+</original_text>
+
+<rewrite_plan>
+{json.dumps(plan_data, ensure_ascii=False)}
+</rewrite_plan>
+
+**CONSTRAINTS:**
+1. Maintain strict factual accuracy. Do NOT invent numbers or names.
+2. Follow the tone: {guide['tone']}.
+3. Structure: {guide['structure']}
+4. Output language: Korean (or original if not Korean).
+
+**OUTPUT:**
+Provide ONLY the rewritten text.
+"""
+            analysis_comment = f"Plan-and-Solve (Actions: {len(plan_data.get('actions',[]))})"
+        else:
+            examples_block = self._build_examples_block(text, target_level)
+            prompt_template = f"""
+You are "{guide['role']}".
+Rewrite the text following these guidelines:
+- Tone: {guide['tone']}
+- Vocab: {guide['vocabulary']}
+- Structure: {guide['structure']}
+
+{examples_block}
+
+Text:
+{{text}}
+
+Output ONLY the rewritten text (in Korean, or original language).
+"""
+            analysis_comment = "Direct Strategy"
+
+        generator = self._iter_actor_critic(
+            prompt_template=prompt_template,
+            original_text=text,
+            context_type="Target Rewrite",
+            progress_callback=progress_callback,
+            critic_provider=critic_provider,
+            persona_guide=guide,
+        )
+
+        return {
+            "generator": generator,
+            "guardrail": guardrail,
+            "analysis_comment": analysis_comment,
+            "original_text": text,
+            "target_level": target_level,
+            "model_version": self.provider,
+        }
+
+    def finalize_interactive(self, session: dict, state: OptimizerState | None) -> dict:
+        """Finalize an interactive session into a result dict."""
+        original_text = session.get("original_text", "")
+        target_level = session.get("target_level", "")
+        analysis_comment = session.get("analysis_comment", "")
+        guardrail = session.get("guardrail")
+
+        rewritten_text = state.current_text if state else ""
+        analysis = {
+            "score": state.current_score if state else 0,
+            "comment": analysis_comment,
+            "feedback": state.feedback if state else "",
+            "status": state.status if state else "UNKNOWN",
+        }
+        result = {
+            "rewritten_text": rewritten_text,
+            "analysis": analysis,
+            "keywords": [],
+            "quizzes": [],
+            "original_text": original_text,
+            "target_level": target_level,
+            "model_version": session.get("model_version", ""),
+        }
+
+        # Skip Guardrail for rollback results (already validated before rollback)
+        is_rollback = state and "ROLLBACK" in (state.message or "")
+        if guardrail and not is_rollback and not guardrail.verify_all(original_text, rewritten_text):
+            logger.warning("🛡️ [Guardrail] Verification Failed. Executing Fallback...")
+            fallback = self._fallback_routine(original_text, [])
+            fallback["analysis"]["comment"] += " | ⚠️ Guardrail Failed -> Fallback"
+            return self._ensure_defaults(
+                fallback,
+                original_text,
+                fallback.get("keywords", []),
+                target_level=target_level,
+                model_version=session.get("model_version", ""),
+            )
+
+        return self._ensure_defaults(
+            result,
+            original_text,
+            result.get("keywords", []),
+            target_level=target_level,
+            model_version=session.get("model_version", ""),
+        )
+
+    def _process_single_chunk(
+        self,
+        text: str,
+        target_level: str,
+        progress_callback,
+        critic_provider=None,
+        decision_callback=None,
+    ) -> dict:
         """Process a single chunk with persona-based rewriting."""
         persona_enum = STRING_TO_ENUM.get(target_level.lower(), TargetPersona.PUBLIC)
         guide = PERSONA_GUIDES[persona_enum]
@@ -150,9 +410,24 @@ class TargetOptimizer:
 
         try:
             if strategy == "PLAN_AND_SOLVE":
-                result = self._execute_plan_and_solve(text, guide, complexity_score, progress_callback, critic_provider)
+                result = self._execute_plan_and_solve(
+                    text,
+                    guide,
+                    target_level,
+                    complexity_score,
+                    progress_callback,
+                    critic_provider,
+                    decision_callback=decision_callback,
+                )
             else:
-                result = self._execute_direct_rewrite(text, guide, progress_callback, critic_provider)
+                result = self._execute_direct_rewrite(
+                    text,
+                    guide,
+                    target_level,
+                    progress_callback,
+                    critic_provider,
+                    decision_callback=decision_callback,
+                )
             
             rewritten_text = result.get("rewritten_text", "")
             if not guardrail.verify_all(text, rewritten_text):
@@ -186,7 +461,69 @@ class TargetOptimizer:
             return "PLAN_AND_SOLVE"
         return "DIRECT_STRATEGY"
 
-    def _execute_plan_and_solve(self, text: str, guide: dict, complexity: float, progress_callback, critic_provider=None) -> dict:
+    def _iter_actor_critic(
+        self,
+        prompt_template: str,
+        original_text: str,
+        context_type: str,
+        progress_callback,
+        critic_provider=None,
+        persona_guide=None,
+    ):
+        return generate_with_critic_loop(
+            actor_provider=self.provider,
+            prompt_template=prompt_template,
+            context_text=original_text,
+            context_type=context_type,
+            max_retries=self.max_retries,
+            extra_retries=self.extra_retries,
+            min_score_for_extra=self.min_score_for_extra,
+            pass_threshold=self.pass_threshold,
+            check_threshold=self.check_threshold,
+            progress_callback=progress_callback,
+            critic_provider=critic_provider,
+            persona_guide=persona_guide,
+        )
+
+    def _run_actor_critic(
+        self,
+        prompt_template: str,
+        original_text: str,
+        context_type: str,
+        progress_callback,
+        critic_provider=None,
+        persona_guide=None,
+        decision_callback=None,
+    ) -> OptimizerState:
+        generator = self._iter_actor_critic(
+            prompt_template,
+            original_text,
+            context_type,
+            progress_callback,
+            critic_provider=critic_provider,
+            persona_guide=persona_guide,
+        )
+        state: OptimizerState | None = None
+        while True:
+            try:
+                if state and state.decision_required:
+                    decision = decision_callback(state) if decision_callback else "accept"
+                    state = generator.send(decision)
+                else:
+                    state = next(generator)
+            except StopIteration as stop:
+                return stop.value or state
+
+    def _execute_plan_and_solve(
+        self,
+        text: str,
+        guide: dict,
+        target_level: str,
+        complexity: float,
+        progress_callback,
+        critic_provider=None,
+        decision_callback=None,
+    ) -> dict:
         """Two-stage: Planner -> Editor with RAG context."""
         from ..utils.json_utils import extract_json
         
@@ -222,14 +559,17 @@ Output a JSON list of rewriting actions:
         plan_data = extract_json(plan_json_str) or {"actions": []}
         
         # Step 2: Editor
-        editor_prompt = f"""
+        examples_block = self._build_examples_block(text, target_level)
+        editor_prompt_template = f"""
 **[SYSTEM PROMPT]**
 You are an expert editor acting as "{guide['role']}".
 Rewrite the text adhering strictly to the plan provided.
 
+{examples_block}
+
 **INPUT DATA:**
 <original_text>
-{text}
+{{text}}
 </original_text>
 
 <rewrite_plan>
@@ -246,58 +586,84 @@ Rewrite the text adhering strictly to the plan provided.
 Provide ONLY the rewritten text.
 """
         logger.info("✍️ [Editor] Rewriting with Actor-Critic Loop...")
-        rewritten_text = generate_with_critic_loop(
-            actor_provider=self.provider,
-            prompt_template="{text}",
-            context_text=editor_prompt,
+        state = self._run_actor_critic(
+            prompt_template=editor_prompt_template,
+            original_text=text,
             context_type="Target Rewrite",
-            max_retries=self.max_retries,
             progress_callback=progress_callback,
             critic_provider=critic_provider,
-            persona_guide=guide
+            persona_guide=guide,
+            decision_callback=decision_callback,
         )
         
         return {
-            "rewritten_text": rewritten_text,
-            "analysis": {"score": 5, "comment": f"Plan-and-Solve (Actions: {len(plan_data.get('actions',[]))})"},
+            "rewritten_text": state.current_text if state else "",
+            "analysis": {
+                "score": state.current_score if state else 0,
+                "comment": f"Plan-and-Solve (Actions: {len(plan_data.get('actions',[]))})",
+                "feedback": state.feedback if state else "",
+                "status": state.status if state else "UNKNOWN",
+            },
             "keywords": [],
             "quizzes": []
         }
 
-    def _execute_direct_rewrite(self, text: str, guide: dict, progress_callback, critic_provider=None) -> dict:
+    def _execute_direct_rewrite(
+        self,
+        text: str,
+        guide: dict,
+        target_level: str,
+        progress_callback,
+        critic_provider=None,
+        decision_callback=None,
+    ) -> dict:
         """Direct single-pass rewriting."""
-        prompt = f"""
+        examples_block = self._build_examples_block(text, target_level)
+        prompt_template = f"""
 You are "{guide['role']}".
 Rewrite the text following these guidelines:
 - Tone: {guide['tone']}
 - Vocab: {guide['vocabulary']}
 - Structure: {guide['structure']}
 
+{examples_block}
+
 Text:
-{text}
+{{text}}
 
 Output ONLY the rewritten text (in Korean, or original language).
 """
         logger.info("⚡ [Direct] Rewriting with Actor-Critic Loop...")
-        rewritten_text = generate_with_critic_loop(
-            actor_provider=self.provider,
-            prompt_template="{text}",
-            context_text=prompt,
+        state = self._run_actor_critic(
+            prompt_template=prompt_template,
+            original_text=text,
             context_type="Target Rewrite",
-            max_retries=self.max_retries,
             progress_callback=progress_callback,
             critic_provider=critic_provider,
-            persona_guide=guide
+            persona_guide=guide,
+            decision_callback=decision_callback,
         )
         
         return {
-            "rewritten_text": rewritten_text,
-            "analysis": {"score": 3, "comment": "Direct Strategy"},
+            "rewritten_text": state.current_text if state else "",
+            "analysis": {
+                "score": state.current_score if state else 0,
+                "comment": "Direct Strategy",
+                "feedback": state.feedback if state else "",
+                "status": state.status if state else "UNKNOWN",
+            },
             "keywords": [],
             "quizzes": []
         }
 
-    def _ensure_defaults(self, result: dict, original_text: str, anchors: list) -> dict:
+    def _ensure_defaults(
+        self,
+        result: dict,
+        original_text: str,
+        anchors: list,
+        target_level: str | None = None,
+        model_version: str | None = None,
+    ) -> dict:
         """Ensure all required fields are present."""
         final = result.copy()
         final["original_text"] = original_text
@@ -313,6 +679,12 @@ Output ONLY the rewritten text (in Korean, or original language).
             
         if "rewritten_text" not in final:
             final["rewritten_text"] = "(Generation failed)"
+
+        if target_level and "target_level" not in final:
+            final["target_level"] = target_level
+
+        if model_version and "model_version" not in final:
+            final["model_version"] = model_version
 
         return final
 
@@ -340,7 +712,14 @@ Output ONLY the rewritten text (in Korean, or original language).
 
 
 # Convenience function
-def generate_target_rewrite(provider, text, level="public", progress_callback=None, critic_provider=None):
+def generate_target_rewrite(
+    provider,
+    text,
+    level="public",
+    progress_callback=None,
+    critic_provider=None,
+    embedding_provider: str | None = None,
+):
     """
     Convenience wrapper for TargetOptimizer.
     
@@ -354,5 +733,11 @@ def generate_target_rewrite(provider, text, level="public", progress_callback=No
     Returns:
         Optimization result dict
     """
-    optimizer = TargetOptimizer(provider)
-    return optimizer.analyze(text, level, progress_callback, critic_provider=critic_provider)
+    optimizer = TargetOptimizer(provider, embedding_provider=embedding_provider)
+    return optimizer.analyze(
+        text,
+        level,
+        progress_callback,
+        critic_provider=critic_provider,
+        embedding_provider=embedding_provider,
+    )
