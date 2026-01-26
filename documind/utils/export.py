@@ -11,8 +11,10 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 def create_txt_bytes(text: str) -> bytes:
-    """Create TXT file bytes."""
-    return text.encode("utf-8")
+    """Create TXT file bytes with UTF-8 BOM for better compatibility."""
+    # UTF-8 BOM helps Korean text display correctly in Windows Notepad and similar editors
+    UTF8_BOM = b'\xef\xbb\xbf'
+    return UTF8_BOM + text.encode("utf-8")
 
 def create_docx_bytes(text: str) -> bytes:
     """Create DOCX file bytes."""
