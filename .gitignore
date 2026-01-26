@@ -87,6 +87,7 @@ optim_best_practices_v2_*/
 
 # Generated Artifacts (Downloads)
 optimized_*
+implementation_plan.md
 
 # Logs
 *.log
