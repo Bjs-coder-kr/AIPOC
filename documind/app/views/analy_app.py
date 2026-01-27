@@ -7,6 +7,8 @@ import hashlib
 import os
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import regex as re
@@ -42,6 +44,8 @@ from documind.llm.config import (
     get_default_actor_provider,
     get_default_critic_provider,
     get_default_embedding_provider,
+    get_api_key,
+    get_api_model,
 )
 from documind.utils.db import db_manager
 from documind.utils.best_practice_manager import archive_best_practice
@@ -60,9 +64,9 @@ from documind.quality.detectors import (
     spelling_ko,
 )
 from documind.quality.pipeline import run_pipeline
-from documind.rag.index import build_index, search_index
+from documind.rag.chunking import chunk_pages
 from documind.rag.qa import build_context, filter_citations
-from documind.schema import DocumentMeta, Report
+from documind.schema import DocumentMeta, Report, Issue, IssueI18n, IssueText, Location
 from documind.target_optimizer import TargetOptimizer
 from documind.text.normalize import normalize_pages
 from documind.utils.logging import setup_logging
@@ -151,6 +155,8 @@ I18N = {
         "filter_options_label": "옵션",
         "results_title": "결과",
         "results_caption": "선택한 조건에 맞는 이슈만 표시됩니다.",
+        "severity_breakdown_title": "심각도별 오류 목록",
+        "severity_breakdown_caption": "상세 내용은 이슈 탭에서 확인하세요.",
         "filter_all": "전체",
         "evidence_label": "근거",
         "no_issues": "조건에 맞는 이슈가 없습니다.",
@@ -197,9 +203,18 @@ I18N = {
         "ai_explain_empty": "AI 설명 결과 0건",
         "ai_explain_error_prefix": "AI 설명 호출 실패",
         "ai_review_error_prefix": "AI 추가 점검 호출 실패",
+        "ai_diag_title": "AI 합의 진단",
+        "ai_diag_caption": "내부 진단 + RAG 근거 기반 GPT/Gemini 교차 검증 결과입니다.",
+        "ai_diag_missing_key": "GPT/Gemini API 키가 필요합니다.",
+        "ai_diag_partial_key": "{provider} 키가 없어 {fallback} 결과만 표시합니다.",
+        "ai_diag_unavailable": "AI 진단 결과가 없습니다.",
+        "ai_diag_consensus_notes": "합의 메모",
+        "ai_diag_gpt_label": "GPT 결과",
+        "ai_diag_gemini_label": "Gemini 결과",
+        "ai_diag_critique_label": "상호 비판",
         "ai_toggle_locked_note": "AI 옵션 변경은 재분석이 필요합니다.",
         "download_ai_button": "report_ai.json 다운로드",
-        "download_ai_help": "report_ai.json에는 AI 설명/추가 점검 결과가 포함됩니다.",
+        "download_ai_help": "report_ai.json에는 AI 진단/설명/추가 점검 결과가 포함됩니다.",
         "processing_title": "분석 중...",
         "processing_subtitle": "분석이 끝날 때까지 잠시만 기다려 주세요.",
         "tab_qa": "질문(Q&A) (베타)",
@@ -212,6 +227,7 @@ I18N = {
         "qa_need_key": "AI 키가 설정되어야 질문할 수 있습니다.",
         "qa_cooldown": "질문 쿨다운: {seconds}초 후 다시 시도하세요.",
         "qa_processing_search": "근거 검색 중...",
+        "qa_processing_rewrite": "질문 정제 중...",
         "qa_processing_answer": "답변 생성 중...",
         "qa_answer_title": "답변",
         "qa_citations_title": "근거",
@@ -333,6 +349,8 @@ I18N = {
         "filter_options_label": "Options",
         "results_title": "Results",
         "results_caption": "Only issues matching the selected filters are shown.",
+        "severity_breakdown_title": "Severity breakdown",
+        "severity_breakdown_caption": "See the Issues tab for details.",
         "filter_all": "All",
         "evidence_label": "Evidence",
         "no_issues": "No issues match the current filters.",
@@ -379,9 +397,18 @@ I18N = {
         "ai_explain_empty": "AI explanations: 0",
         "ai_explain_error_prefix": "AI explanation failed",
         "ai_review_error_prefix": "AI review failed",
+        "ai_diag_title": "AI consensus diagnosis",
+        "ai_diag_caption": "Cross-checked GPT/Gemini diagnosis using internal checks and RAG evidence.",
+        "ai_diag_missing_key": "GPT/Gemini API keys are required.",
+        "ai_diag_partial_key": "{provider} key missing; showing {fallback} only.",
+        "ai_diag_unavailable": "AI diagnosis result is unavailable.",
+        "ai_diag_consensus_notes": "Consensus notes",
+        "ai_diag_gpt_label": "GPT result",
+        "ai_diag_gemini_label": "Gemini result",
+        "ai_diag_critique_label": "Cross critiques",
         "ai_toggle_locked_note": "Changing AI options requires re-analysis.",
         "download_ai_button": "Download report_ai.json",
-        "download_ai_help": "report_ai.json includes AI explanations and extra review results.",
+        "download_ai_help": "report_ai.json includes AI diagnosis, explanations, and extra review results.",
         "processing_title": "Analyzing...",
         "processing_subtitle": "Please wait until analysis completes.",
         "tab_qa": "Q&A (beta)",
@@ -394,6 +421,7 @@ I18N = {
         "qa_need_key": "Set an API key to enable Q&A.",
         "qa_cooldown": "Q&A cooldown: try again in {seconds}s.",
         "qa_processing_search": "Retrieving evidence...",
+        "qa_processing_rewrite": "Refining question...",
         "qa_processing_answer": "Generating answer...",
         "qa_answer_title": "Answer",
         "qa_citations_title": "Citations",
@@ -448,6 +476,15 @@ SUPPORTED_FILE_TYPES = ["pdf", "txt", "md", "docx"]
 TEXT_FILE_TYPES = {"txt", "md"}
 SCAN_LIKE_THRESHOLD = 0.6
 MIN_TEXT_LEN = 50
+RAG_COLLECTION_NAME = "documind_rag"
+RAG_CHUNK_SIZE = 900
+RAG_CHUNK_OVERLAP = 120
+RAG_EMBED_BATCH_SIZE = 32
+RAG_QUERY_LIMIT = 3
+RAG_QUERY_MAX_CHARS = 120
+AI_INTERNAL_MAX_ISSUES = 24
+AI_DIAG_MAX_ISSUES = 12
+AI_DIAG_MAX_CONCERNS = 6
 
 LANG_LABELS = {
     "ko": "한국어",
@@ -632,6 +669,11 @@ SEVERITY_LABELS = {
         "YELLOW": "Medium",
         "GREEN": "Low",
     },
+}
+SEVERITY_ICONS = {
+    "RED": "🔴",
+    "YELLOW": "🟡",
+    "GREEN": "🟢",
 }
 
 CUSTOM_CSS = """
@@ -897,6 +939,16 @@ if "ai_call_count" not in st.session_state:
     st.session_state["ai_call_count"] = {"explain": 0, "review": 0}
 if "last_ai_run_ts" not in st.session_state:
     st.session_state["last_ai_run_ts"] = 0.0
+if "ai_diag_cache" not in st.session_state:
+    st.session_state["ai_diag_cache"] = {}
+if "ai_diag_result" not in st.session_state:
+    st.session_state["ai_diag_result"] = None
+if "ai_diag_status" not in st.session_state:
+    st.session_state["ai_diag_status"] = None
+if "ai_diag_errors" not in st.session_state:
+    st.session_state["ai_diag_errors"] = {"gpt": None, "gemini": None, "final": None}
+if "last_ai_diag_ts" not in st.session_state:
+    st.session_state["last_ai_diag_ts"] = 0.0
 if "rag_index_cache" not in st.session_state:
     st.session_state["rag_index_cache"] = {}
 if "rag_last_question" not in st.session_state:
@@ -1295,8 +1347,734 @@ def _ai_cache_key(file_hash: str, lang: str, explain: bool, review: bool) -> str
     return f"{file_hash}:{lang}:explain={int(explain)}:review={int(review)}"
 
 
-def _rag_cache_key(file_hash: str, lang: str) -> str:
-    return f"{file_hash}:{lang}:rag"
+def _rag_cache_key(file_hash: str, lang: str, embedding_provider: str) -> str:
+    return f"{file_hash}:{lang}:{embedding_provider}:rag"
+
+
+def _rag_owner_key(
+    user_id: str | None, file_hash: str, lang: str, embedding_provider: str
+) -> str:
+    owner = user_id or "anonymous"
+    return f"{owner}:{file_hash}:{lang}:{embedding_provider}"
+
+
+def _rag_where_filter(
+    owner_key: str,
+    file_hash: str,
+    lang: str,
+    embedding_provider: str,
+    is_admin: bool,
+) -> dict:
+    if is_admin:
+        return {
+            "file_hash": file_hash,
+            "lang": lang,
+            "embedding_provider": embedding_provider,
+        }
+    return {"owner_key": owner_key}
+
+
+def _get_chroma_collection():
+    import chromadb
+
+    persist_dir = str(Path(__file__).resolve().parents[3] / "chroma_raw")
+    client = chromadb.PersistentClient(path=persist_dir)
+    try:
+        return client.get_or_create_collection(
+            name=RAG_COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+        )
+    except TypeError:
+        return client.get_or_create_collection(name=RAG_COLLECTION_NAME)
+
+
+def _chroma_owner_exists(collection, owner_key: str) -> bool:
+    try:
+        existing = collection.get(where={"owner_key": owner_key})
+    except Exception:
+        return False
+    if not isinstance(existing, dict):
+        return False
+    ids = existing.get("ids") or []
+    return len(ids) > 0
+
+
+def _build_chroma_index(
+    client: OpenAIClient,
+    pages: list[dict],
+    owner_key: str,
+    file_name: str,
+    file_hash: str,
+    lang: str,
+    embedding_provider: str,
+    user_id: str | None,
+) -> object | None:
+    collection = _get_chroma_collection()
+    if _chroma_owner_exists(collection, owner_key):
+        return collection
+    chunks = chunk_pages(pages, chunk_size=RAG_CHUNK_SIZE, overlap=RAG_CHUNK_OVERLAP)
+    if not chunks:
+        return None
+    texts = [redact_text(chunk["text"]) for chunk in chunks]
+    embeddings: list[list[float]] = []
+    for start in range(0, len(texts), RAG_EMBED_BATCH_SIZE):
+        batch = texts[start : start + RAG_EMBED_BATCH_SIZE]
+        batch_embeddings = client.embed_texts(batch)
+        if not batch_embeddings:
+            return None
+        embeddings.extend(batch_embeddings)
+    if len(embeddings) != len(chunks):
+        return None
+    documents: list[str] = []
+    valid_embeddings: list[list[float]] = []
+    metadatas: list[dict] = []
+    ids: list[str] = []
+    for chunk, embedding in zip(chunks, embeddings):
+        if not embedding:
+            continue
+        page_number = int(chunk.get("page", chunk.get("page_number", 0)))
+        documents.append(redact_text(chunk.get("text", "")))
+        metadatas.append(
+            {
+                "owner_key": owner_key,
+                "user_id": user_id or "anonymous",
+                "file_hash": file_hash,
+                "lang": lang,
+                "embedding_provider": embedding_provider,
+                "source": file_name,
+                "filename": file_name,
+                "page": page_number,
+                "chunk_id": chunk.get("chunk_id", ""),
+                "start_char": int(chunk.get("start_char", 0)),
+                "end_char": int(chunk.get("end_char", 0)),
+            }
+        )
+        ids.append(f"{owner_key}:{chunk.get('chunk_id', len(ids))}")
+        valid_embeddings.append(embedding)
+    if not documents:
+        return None
+    try:
+        collection.add(
+            documents=documents,
+            embeddings=valid_embeddings,
+            metadatas=metadatas,
+            ids=ids,
+        )
+    except Exception:
+        return None
+    return collection
+
+
+def _dedup_queries(queries: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for query in queries:
+        normalized = query.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def _keyword_query(question: str) -> str | None:
+    keywords = _extract_keywords(question)
+    if not keywords:
+        return None
+    return " ".join(keywords[:8])
+
+
+def _expand_rag_queries(
+    client: OpenAIClient, question: str, language: str
+) -> list[str]:
+    base_queries = [question]
+    keyword_query = _keyword_query(question)
+    if keyword_query:
+        base_queries.append(keyword_query)
+    if not client.is_available():
+        return _dedup_queries(base_queries)[:RAG_QUERY_LIMIT]
+    lang_hint = "Korean" if language == "ko" else "English"
+    prompt = (
+        "Return ONLY JSON.\n"
+        "Schema: {\"queries\": [\"...\"]}\n"
+        f"Generate up to {max(1, RAG_QUERY_LIMIT - 1)} short search queries.\n"
+        "Use keyword-style phrases, avoid full sentences.\n"
+        f"Write in {lang_hint}.\n"
+        f"Question: {question}"
+    )
+    try:
+        data = client._chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=240,
+        )
+        if not data:
+            return _dedup_queries(base_queries)[:RAG_QUERY_LIMIT]
+        content = client._extract_content(data)
+        parsed = client._parse_json(content)
+        queries = []
+        if isinstance(parsed, dict):
+            raw_queries = parsed.get("queries") or []
+            if isinstance(raw_queries, list):
+                for query in raw_queries:
+                    if not isinstance(query, str):
+                        continue
+                    trimmed = query.strip()
+                    if not trimmed:
+                        continue
+                    queries.append(trimmed[:RAG_QUERY_MAX_CHARS])
+        return _dedup_queries(base_queries + queries)[:RAG_QUERY_LIMIT]
+    except Exception:
+        return _dedup_queries(base_queries)[:RAG_QUERY_LIMIT]
+
+
+def _distance_to_score(distance: float | None) -> float:
+    if distance is None:
+        return 0.0
+    try:
+        dist = float(distance)
+    except (TypeError, ValueError):
+        return 0.0
+    if dist <= 1.0:
+        return 1.0 - dist
+    return 1.0 / (1.0 + dist)
+
+
+def _search_chroma(
+    collection,
+    query_embeddings: list[list[float]],
+    top_k: int,
+    where_filter: dict,
+) -> list[dict]:
+    if not query_embeddings:
+        return []
+    per_query = min(max(top_k * 4, 8), 24)
+    try:
+        results = collection.query(
+            query_embeddings=query_embeddings,
+            n_results=per_query,
+            where=where_filter,
+            include=["documents", "metadatas", "distances", "ids"],
+        )
+    except Exception:
+        return []
+    if not isinstance(results, dict):
+        return []
+    ids_list = results.get("ids") or []
+    docs_list = results.get("documents") or []
+    metas_list = results.get("metadatas") or []
+    dists_list = results.get("distances") or []
+    combined: dict[str, dict] = {}
+    for idx, ids in enumerate(ids_list):
+        docs = docs_list[idx] if idx < len(docs_list) else []
+        metas = metas_list[idx] if idx < len(metas_list) else []
+        dists = dists_list[idx] if idx < len(dists_list) else []
+        for doc_id, doc, meta, dist in zip(ids, docs, metas, dists):
+            if not doc:
+                continue
+            doc_key = str(doc_id)
+            score = _distance_to_score(dist)
+            existing = combined.get(doc_key)
+            if existing is None or score > existing["score"]:
+                combined[doc_key] = {
+                    "doc": doc,
+                    "meta": meta or {},
+                    "score": score,
+                }
+    ranked = sorted(combined.values(), key=lambda item: item["score"], reverse=True)
+    results: list[dict] = []
+    for item in ranked[:top_k]:
+        meta = item.get("meta") or {}
+        page = int(meta.get("page") or meta.get("page_number") or 0)
+        chunk_id = str(meta.get("chunk_id") or "")
+        results.append(
+            {
+                "text": item.get("doc", ""),
+                "page": page,
+                "page_number": page,
+                "chunk_id": chunk_id,
+                "score": round(float(item.get("score", 0.0)), 4),
+            }
+        )
+    return results
+
+
+def _ai_diag_cache_key(file_hash: str, lang: str, embedding_provider: str) -> str:
+    return f"{file_hash}:{lang}:{embedding_provider}:diag"
+
+
+def _gpt_available() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def _gemini_available() -> bool:
+    return bool(get_api_key("gemini"))
+
+
+def _parse_json_payload(text: str) -> dict | None:
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _normalize_ai_issue(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    severity = str(item.get("severity") or "").upper()
+    if severity not in {"RED", "YELLOW", "GREEN"}:
+        return None
+    category = str(item.get("category") or "").lower()
+    if category not in {"spelling", "grammar", "readability", "logic", "redundancy"}:
+        category = "readability"
+    try:
+        page = int(item.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    message_ko = str(item.get("message_ko") or item.get("message") or "").strip()
+    message_en = str(item.get("message_en") or "").strip()
+    suggestion_ko = str(item.get("suggestion_ko") or "").strip()
+    suggestion_en = str(item.get("suggestion_en") or "").strip()
+    if not message_ko and not message_en:
+        return None
+    return {
+        "severity": severity,
+        "category": category,
+        "page": page,
+        "message_ko": message_ko,
+        "message_en": message_en,
+        "suggestion_ko": suggestion_ko,
+        "suggestion_en": suggestion_en,
+    }
+
+
+def _normalize_ai_result(payload: dict) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    score_raw = payload.get("overall_score")
+    try:
+        score = int(float(score_raw))
+    except (TypeError, ValueError):
+        score = None
+    if score is None or score < 0 or score > 100:
+        score = None
+    summary_ko = str(payload.get("summary_ko") or "").strip()
+    summary_en = str(payload.get("summary_en") or "").strip()
+    diagnostics_ko = str(payload.get("diagnostics_ko") or "").strip()
+    diagnostics_en = str(payload.get("diagnostics_en") or "").strip()
+    consensus_ko = str(payload.get("consensus_notes_ko") or "").strip()
+    consensus_en = str(payload.get("consensus_notes_en") or "").strip()
+    issues: list[dict] = []
+    for item in payload.get("issues") or []:
+        normalized = _normalize_ai_issue(item)
+        if normalized:
+            issues.append(normalized)
+        if len(issues) >= AI_DIAG_MAX_ISSUES:
+            break
+    if not issues:
+        issues = []
+    return {
+        "overall_score": score,
+        "summary_ko": summary_ko,
+        "summary_en": summary_en,
+        "diagnostics_ko": diagnostics_ko,
+        "diagnostics_en": diagnostics_en,
+        "issues": issues,
+        "consensus_notes_ko": consensus_ko,
+        "consensus_notes_en": consensus_en,
+    }
+
+
+def _convert_ai_issues(ai_issues: list[dict], language: str) -> list[Issue]:
+    results: list[Issue] = []
+    severity_to_kind = {"RED": "ERROR", "YELLOW": "WARNING", "GREEN": "NOTE"}
+    for idx, item in enumerate(ai_issues):
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity") or "").upper()
+        if severity not in severity_to_kind:
+            continue
+        category = str(item.get("category") or "readability")
+        if category not in {"spelling", "grammar", "readability", "logic", "redundancy"}:
+            category = "readability"
+        page = item.get("page") or 1
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        message_ko = str(item.get("message_ko") or "").strip()
+        message_en = str(item.get("message_en") or "").strip()
+        suggestion_ko = str(item.get("suggestion_ko") or "").strip()
+        suggestion_en = str(item.get("suggestion_en") or "").strip()
+        message = message_en if language == "en" else message_ko
+        suggestion = suggestion_en if language == "en" else suggestion_ko
+        if not message:
+            message = message_en or message_ko or "AI diagnosis"
+        if not suggestion:
+            suggestion = suggestion_en or suggestion_ko or ""
+        i18n = IssueI18n(
+            ko=IssueText(message=message_ko or message, suggestion=suggestion_ko or ""),
+            en=IssueText(message=message_en or message, suggestion=suggestion_en or ""),
+        )
+        evidence = message
+        results.append(
+            Issue(
+                id=f"ai_final_{idx}_p{page}",
+                category=category,
+                kind=severity_to_kind[severity],
+                subtype=None,
+                severity=severity,
+                message=message,
+                evidence=evidence,
+                suggestion=suggestion,
+                location=Location(page=page, start_char=0, end_char=max(1, len(evidence))),
+                confidence=0.7,
+                detector="llm_based",
+                i18n=i18n,
+            )
+        )
+        if len(results) >= AI_DIAG_MAX_ISSUES:
+            break
+    return results
+
+
+def _build_internal_diagnosis_payload(report: Report, language: str) -> dict:
+    severity_rank = {"RED": 3, "YELLOW": 2, "GREEN": 1}
+    issues = sorted(
+        report.issues,
+        key=lambda item: (severity_rank.get(item.severity, 0), item.location.page),
+        reverse=True,
+    )
+    items: list[dict] = []
+    for issue in issues[:AI_INTERNAL_MAX_ISSUES]:
+        text = issue.i18n.ko if language == "ko" else issue.i18n.en
+        items.append(
+            {
+                "severity": issue.severity,
+                "category": issue.category,
+                "page": issue.location.page,
+                "message": redact_text(text.message),
+                "suggestion": redact_text(text.suggestion),
+                "evidence": redact_text(issue.evidence),
+            }
+        )
+    meta = report.document_meta
+    return {
+        "file_name": meta.file_name,
+        "page_count": meta.page_count,
+        "scan_level": meta.scan_level,
+        "scan_like": meta.scan_like,
+        "document_profile": {
+            "type": meta.document_profile.type,
+            "dominant_type": meta.document_profile.dominant_type,
+            "confidence": meta.document_profile.confidence,
+        },
+        "internal_score": report.raw_score,
+        "issues": items,
+    }
+
+
+def _build_issue_queries(issues: list, language: str) -> list[str]:
+    severity_rank = {"RED": 3, "YELLOW": 2, "GREEN": 1}
+    sorted_issues = sorted(
+        issues,
+        key=lambda item: (severity_rank.get(item.severity, 0), item.location.page),
+        reverse=True,
+    )
+    queries: list[str] = []
+    for issue in sorted_issues[:RAG_QUERY_LIMIT]:
+        text = issue.i18n.ko if language == "ko" else issue.i18n.en
+        message = text.message.strip()
+        suggestion = text.suggestion.strip()
+        if not message:
+            continue
+        query = f"{message} {suggestion}".strip()
+        queries.append(query[:RAG_QUERY_MAX_CHARS])
+    return _dedup_queries(queries)
+
+
+def _build_rag_context_for_diagnosis(
+    client: OpenAIClient,
+    pages: list[dict],
+    report: Report,
+    file_name: str,
+    file_hash: str,
+    language: str,
+    embedding_provider: str,
+    user_id: str | None,
+    owner_key: str,
+) -> str:
+    if not pages:
+        return ""
+    collection = _build_chroma_index(
+        client,
+        pages,
+        owner_key,
+        file_name,
+        file_hash,
+        language,
+        embedding_provider,
+        user_id,
+    )
+    if collection is None:
+        return ""
+    queries = _build_issue_queries(report.issues, language)
+    if not queries:
+        return ""
+    embeddings = client.embed_texts(queries)
+    if not embeddings:
+        return ""
+    where_filter = _rag_where_filter(owner_key, file_hash, language, embedding_provider, False)
+    chunks = _search_chroma(collection, embeddings, top_k=6, where_filter=where_filter)
+    if not chunks:
+        return ""
+    return build_context(chunks)
+
+
+def _build_ai_diag_prompt(
+    internal_payload: dict, rag_context: str, language: str
+) -> str:
+    lang_hint = "Korean" if language == "ko" else "English"
+    internal_json = json.dumps(internal_payload, ensure_ascii=False)
+    prompt = (
+        "Return ONLY JSON.\n"
+        "Schema: {\n"
+        "  \"overall_score\": 0-100,\n"
+        "  \"summary_ko\": \"...\",\n"
+        "  \"summary_en\": \"...\",\n"
+        "  \"diagnostics_ko\": \"...\",\n"
+        "  \"diagnostics_en\": \"...\",\n"
+        "  \"issues\": [\n"
+        "    {\n"
+        "      \"severity\": \"RED|YELLOW|GREEN\",\n"
+        "      \"category\": \"spelling|grammar|readability|logic|redundancy\",\n"
+        "      \"page\": 1,\n"
+        "      \"message_ko\": \"...\",\n"
+        "      \"message_en\": \"...\",\n"
+        "      \"suggestion_ko\": \"...\",\n"
+        "      \"suggestion_en\": \"...\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        f"Rules: limit issues to {AI_DIAG_MAX_ISSUES}. Keep messages short and practical.\n"
+        "Use internal diagnostics as hints and verify with context. If evidence is weak, lower severity.\n"
+        f"Write the main narrative in {lang_hint} while filling both ko/en fields.\n"
+        f"Internal diagnostics JSON:\n{internal_json}\n"
+    )
+    if rag_context:
+        prompt += f"\nRAG context:\n{rag_context}\n"
+    return prompt
+
+
+def _build_ai_critique_prompt(
+    self_payload: dict, other_payload: dict
+) -> str:
+    self_json = json.dumps(self_payload, ensure_ascii=False)
+    other_json = json.dumps(other_payload, ensure_ascii=False)
+    return (
+        "Return ONLY JSON.\n"
+        "Schema: {\"concerns\": [\"...\"], \"missing_checks\": [\"...\"], \"overstatements\": [\"...\"]}\n"
+        f"Limit each list to {AI_DIAG_MAX_CONCERNS} short bullets.\n"
+        "Identify disagreements, missing checks, or overstatements in the other result.\n"
+        f"Your result:\n{self_json}\n"
+        f"Other result:\n{other_json}\n"
+    )
+
+
+def _call_gemini_text(prompt: str) -> tuple[str | None, str | None]:
+    api_key = get_api_key("gemini")
+    model = get_api_model("gemini") or "gemini-2.5-pro"
+    if not api_key:
+        return None, "missing_key"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1200},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=40) as response:
+            raw = response.read().decode("utf-8")
+        parsed = json.loads(raw)
+        candidates = parsed.get("candidates") or []
+        if not candidates:
+            return None, "empty_response"
+        content = candidates[0].get("content") or {}
+        parts = content.get("parts") or []
+        if not parts:
+            return None, "empty_response"
+        text = str(parts[0].get("text") or "").strip()
+        return text, None
+    except urllib.error.HTTPError as exc:
+        return None, f"http_error_{exc.code}"
+    except urllib.error.URLError:
+        return None, "url_error"
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    except Exception as exc:
+        return None, f"request_failed_{exc.__class__.__name__}"
+
+
+def _run_gpt_diagnosis(prompt: str) -> tuple[dict | None, str | None]:
+    client = OpenAIClient()
+    data = client._chat([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=1200)
+    if not data:
+        return None, client.last_error or "empty_response"
+    content = client._extract_content(data)
+    if not content:
+        return None, "empty_response"
+    parsed = _parse_json_payload(content)
+    normalized = _normalize_ai_result(parsed or {})
+    return (normalized, None) if normalized else (None, "invalid_json")
+
+
+def _run_gemini_diagnosis(prompt: str) -> tuple[dict | None, str | None]:
+    content, error = _call_gemini_text(prompt)
+    if not content:
+        return None, error or "empty_response"
+    parsed = _parse_json_payload(content)
+    normalized = _normalize_ai_result(parsed or {})
+    return (normalized, None) if normalized else (None, "invalid_json")
+
+
+def _run_gpt_critique(self_payload: dict, other_payload: dict) -> tuple[dict | None, str | None]:
+    prompt = _build_ai_critique_prompt(self_payload, other_payload)
+    client = OpenAIClient()
+    data = client._chat([{"role": "user", "content": prompt}], temperature=0.2, max_tokens=600)
+    if not data:
+        return None, client.last_error or "empty_response"
+    content = client._extract_content(data)
+    if not content:
+        return None, "empty_response"
+    parsed = _parse_json_payload(content)
+    return (parsed, None) if parsed else (None, "invalid_json")
+
+
+def _run_gemini_critique(self_payload: dict, other_payload: dict) -> tuple[dict | None, str | None]:
+    prompt = _build_ai_critique_prompt(self_payload, other_payload)
+    content, error = _call_gemini_text(prompt)
+    if not content:
+        return None, error or "empty_response"
+    parsed = _parse_json_payload(content)
+    return (parsed, None) if parsed else (None, "invalid_json")
+
+
+def _build_ai_final_prompt(
+    internal_payload: dict,
+    rag_context: str,
+    gpt_payload: dict | None,
+    gemini_payload: dict | None,
+    gpt_critique: dict | None,
+    gemini_critique: dict | None,
+    average_score: int | None,
+    language: str,
+) -> str:
+    lang_hint = "Korean" if language == "ko" else "English"
+    internal_json = json.dumps(internal_payload, ensure_ascii=False)
+    gpt_json = json.dumps(gpt_payload or {}, ensure_ascii=False)
+    gemini_json = json.dumps(gemini_payload or {}, ensure_ascii=False)
+    gpt_crit = json.dumps(gpt_critique or {}, ensure_ascii=False)
+    gemini_crit = json.dumps(gemini_critique or {}, ensure_ascii=False)
+    prompt = (
+        "Return ONLY JSON.\n"
+        "Schema: {\n"
+        "  \"overall_score\": 0-100,\n"
+        "  \"summary_ko\": \"...\",\n"
+        "  \"summary_en\": \"...\",\n"
+        "  \"diagnostics_ko\": \"...\",\n"
+        "  \"diagnostics_en\": \"...\",\n"
+        "  \"issues\": [\n"
+        "    {\n"
+        "      \"severity\": \"RED|YELLOW|GREEN\",\n"
+        "      \"category\": \"spelling|grammar|readability|logic|redundancy\",\n"
+        "      \"page\": 1,\n"
+        "      \"message_ko\": \"...\",\n"
+        "      \"message_en\": \"...\",\n"
+        "      \"suggestion_ko\": \"...\",\n"
+        "      \"suggestion_en\": \"...\"\n"
+        "    }\n"
+        "  ],\n"
+        "  \"consensus_notes_ko\": \"...\",\n"
+        "  \"consensus_notes_en\": \"...\"\n"
+        "}\n"
+        f"Rules: limit issues to {AI_DIAG_MAX_ISSUES}. Use average_score if provided.\n"
+        f"Write the main narrative in {lang_hint} while filling both ko/en fields.\n"
+        f"Average score: {average_score}\n"
+        f"Internal diagnostics JSON:\n{internal_json}\n"
+        f"GPT JSON:\n{gpt_json}\n"
+        f"Gemini JSON:\n{gemini_json}\n"
+        f"GPT critique:\n{gpt_crit}\n"
+        f"Gemini critique:\n{gemini_crit}\n"
+    )
+    if rag_context:
+        prompt += f"\nRAG context:\n{rag_context}\n"
+    return prompt
+
+
+def _merge_ai_results(gpt_payload: dict | None, gemini_payload: dict | None) -> dict | None:
+    if not gpt_payload and not gemini_payload:
+        return None
+    gpt_score = gpt_payload.get("overall_score") if gpt_payload else None
+    gemini_score = gemini_payload.get("overall_score") if gemini_payload else None
+    scores = [score for score in (gpt_score, gemini_score) if isinstance(score, int)]
+    avg_score = int(sum(scores) / len(scores)) if scores else None
+    combined_issues: list[dict] = []
+    seen: set[tuple] = set()
+    for payload in (gpt_payload, gemini_payload):
+        if not payload:
+            continue
+        for item in payload.get("issues", []):
+            key = (item.get("severity"), item.get("category"), item.get("message_ko"))
+            if key in seen:
+                continue
+            seen.add(key)
+            combined_issues.append(item)
+    combined_issues = combined_issues[:AI_DIAG_MAX_ISSUES]
+    summary_ko = ""
+    summary_en = ""
+    diagnostics_ko = ""
+    diagnostics_en = ""
+    for payload in (gpt_payload, gemini_payload):
+        if not payload:
+            continue
+        if not summary_ko:
+            summary_ko = payload.get("summary_ko", "")
+        if not summary_en:
+            summary_en = payload.get("summary_en", "")
+        if not diagnostics_ko:
+            diagnostics_ko = payload.get("diagnostics_ko", "")
+        if not diagnostics_en:
+            diagnostics_en = payload.get("diagnostics_en", "")
+    return {
+        "overall_score": avg_score,
+        "summary_ko": summary_ko,
+        "summary_en": summary_en,
+        "diagnostics_ko": diagnostics_ko,
+        "diagnostics_en": diagnostics_en,
+        "issues": combined_issues,
+        "consensus_notes_ko": "",
+        "consensus_notes_en": "",
+    }
 
 
 def _build_ai_issue_payload(issues: list) -> list[dict]:
@@ -1381,29 +2159,34 @@ def _run_rag_qa(
     client: OpenAIClient,
     question: str,
     pages: list[dict],
-    rag_index: dict,
+    rag_collection,
+    owner_key: str,
     top_k: int,
     language: str,
     scan_level: str,
     status_callback=None,
-    user_filter: str | None = None,
+    file_hash: str | None = None,
+    embedding_provider: str | None = None,
     is_admin: bool = False,
 ) -> dict | None:
-    if not question.strip() or not rag_index:
+    if not question.strip() or rag_collection is None:
+        return None
+    if status_callback:
+        status_callback("rewrite")
+    queries = _expand_rag_queries(client, question, language)
+    query_embeddings = client.embed_texts(queries)
+    if not query_embeddings:
         return None
     if status_callback:
         status_callback("search")
-    query_embeddings = client.embed_texts([question])
-    if not query_embeddings:
-        return None
-    query_embedding = query_embeddings[0]
-    chunks = search_index(
-        rag_index, 
-        query_embedding, 
-        top_k=top_k, 
-        user_filter=user_filter, 
-        is_admin=is_admin
+    where_filter = _rag_where_filter(
+        owner_key,
+        file_hash or "",
+        language,
+        embedding_provider or "",
+        is_admin,
     )
+    chunks = _search_chroma(rag_collection, query_embeddings, top_k, where_filter)
     if not chunks:
         return None
     context = build_context(chunks)
@@ -1824,29 +2607,40 @@ def render_chroma_explorer():
     persist_dir_best = str(Path(__file__).resolve().parents[3] / "chroma_best_practices")
     
     tab_rag, tab_best = st.tabs(["📚 RAG Documents", "🏆 Best Practices"])
-    
+
     with tab_rag:
         try:
             client = chromadb.PersistentClient(path=persist_dir_raw)
+            collection_names = []
             try:
-                collection = client.get_collection(name="langchain")
+                collection_names = [col.name for col in client.list_collections()]
             except Exception:
-                st.info("No 'langchain' collection found in ChromaDB.")
+                collection_names = []
+            if not collection_names:
+                collection_names = ["langchain", RAG_COLLECTION_NAME]
+            collection_name = st.selectbox(
+                "Collection",
+                options=collection_names,
+                key="chroma_collection_select",
+            )
+            try:
+                collection = client.get_collection(name=collection_name)
+            except Exception:
+                st.info(f"No '{collection_name}' collection found in ChromaDB.")
                 collection = None
-            
             if collection:
                 if is_admin:
                     results = collection.get()
                 else:
                     results = collection.get(where={"user_id": username})
-                    
+
                 if not results or not results.get("documents"):
                     st.info("No RAG data for current user.")
                 else:
                     docs = results["documents"]
                     metas = results["metadatas"]
                     ids = results["ids"]
-                    
+
                     display_data = []
                     for i in range(len(docs)):
                         m = metas[i] or {}
@@ -1857,18 +2651,26 @@ def render_chroma_explorer():
                             t["doc_user"]: m.get("user_id", "N/A"),
                             t["rag_content"]: docs[i][:200] + "..." if len(docs[i]) > 200 else docs[i]
                         })
-                    
+
                     import pandas as pd
                     df = pd.DataFrame(display_data)
                     st.dataframe(df, use_container_width=True, hide_index=True)
+
+                    st.subheader("Detail View")
+                    selected_id = st.selectbox(
+                        "Select ID to view full content",
+                        options=ids,
+                        key=f"chroma_detail_select_{collection_name}",
+                    )
+                    if selected_id:
+                        idx = ids.index(selected_id)
+                        st.text_area("Full Content", value=docs[idx], height=300)
         except Exception as e:
             st.error(f"Failed to load RAG ChromaDB: {e}")
-    
+
     with tab_best:
         try:
             client_best = chromadb.PersistentClient(path=persist_dir_best)
-            # Determine collection based on current provider
-            # Allow user to select which provider's DB to view (Buttons/Radio)
             explorer_provider = st.radio(
                 "DB Provider",
                 options=get_available_embedding_providers(),
@@ -1886,7 +2688,9 @@ def render_chroma_explorer():
             try:
                 collection_best = client_best.get_collection(name=coll_name)
             except Exception:
-                st.warning(f"No collection found for {current_provider}. Try running an optimization first!")
+                st.warning(
+                    f"No collection found for {explorer_provider}. Try running an optimization first!"
+                )
                 collection_best = None
             
             if collection_best:
@@ -1916,7 +2720,11 @@ def render_chroma_explorer():
                     st.dataframe(df_b, use_container_width=True, hide_index=True)
                     
                     st.subheader("Detail View")
-                    selected_id_b = st.selectbox("Select ID to view full content", options=ids_b, key="chroma_best_detail_select")
+                    selected_id_b = st.selectbox(
+                        "Select ID to view full content",
+                        options=ids_b,
+                        key="chroma_best_detail_select",
+                    )
                     if selected_id_b:
                         idx_b = ids_b.index(selected_id_b)
                         
@@ -2060,6 +2868,10 @@ with st.container():
         st.session_state["ai_status"] = {"explain": None, "review": None}
         st.session_state["ai_errors"] = {"explain": None, "review": None}
         st.session_state["ai_cache"] = {}
+        st.session_state["ai_diag_cache"] = {}
+        st.session_state["ai_diag_result"] = None
+        st.session_state["ai_diag_status"] = None
+        st.session_state["ai_diag_errors"] = {"gpt": None, "gemini": None, "final": None}
         st.session_state["rag_index_cache"] = {}
         st.session_state["rag_last_question"] = ""
         st.session_state["rag_last_result"] = None
@@ -2091,6 +2903,10 @@ with st.container():
             st.session_state["ai_status"] = {"explain": None, "review": None}
             st.session_state["ai_errors"] = {"explain": None, "review": None}
             st.session_state["ai_cache"] = {}
+            st.session_state["ai_diag_cache"] = {}
+            st.session_state["ai_diag_result"] = None
+            st.session_state["ai_diag_status"] = None
+            st.session_state["ai_diag_errors"] = {"gpt": None, "gemini": None, "final": None}
             st.session_state["rag_index_cache"] = {}
             st.session_state["rag_last_question"] = ""
             st.session_state["rag_last_result"] = None
@@ -2116,6 +2932,9 @@ with st.container():
             ai_candidates = None
             ai_status = {"explain": None, "review": None}
             ai_errors = {"explain": None, "review": None}
+            ai_diag_result = None
+            ai_diag_status = None
+            ai_diag_errors = {"gpt": None, "gemini": None, "final": None}
             try:
                 st.session_state["is_running"] = True
                 overlay_placeholder.markdown(
@@ -2220,6 +3039,137 @@ with st.container():
                                     "ai_status": ai_status,
                                     "ai_errors": ai_errors,
                                 }
+                    if report is not None:
+                        embedding_provider = (
+                            st.session_state.get("embedding_provider") or "OpenAI"
+                        )
+                        gpt_ok = _gpt_available()
+                        gemini_ok = _gemini_available()
+                        if gpt_ok or gemini_ok:
+                            diag_cache_key = _ai_diag_cache_key(
+                                st.session_state["file_hash"], lang, embedding_provider
+                            )
+                            cached_diag = st.session_state["ai_diag_cache"].get(
+                                diag_cache_key
+                            )
+                            if cached_diag:
+                                ai_diag_result = cached_diag.get("ai_diag_result")
+                                ai_diag_status = cached_diag.get("ai_diag_status")
+                                ai_diag_errors = cached_diag.get(
+                                    "ai_diag_errors", ai_diag_errors
+                                )
+                            else:
+                                now = time.time()
+                                elapsed = now - st.session_state["last_ai_diag_ts"]
+                                cooldown_hit = (
+                                    AI_COOLDOWN_SECONDS > 0
+                                    and elapsed < AI_COOLDOWN_SECONDS
+                                )
+                                if cooldown_hit:
+                                    remaining = max(
+                                        1, int(AI_COOLDOWN_SECONDS - elapsed + 0.999)
+                                    )
+                                    ai_diag_status = "cooldown"
+                                    ai_diag_errors["final"] = f"cooldown_{remaining}"
+                                else:
+                                    internal_payload = _build_internal_diagnosis_payload(
+                                        report, lang
+                                    )
+                                    owner_key = _rag_owner_key(
+                                        st.session_state.get("username"),
+                                        st.session_state["file_hash"],
+                                        lang,
+                                        embedding_provider,
+                                    )
+                                    source_name = (
+                                        uploaded_file.name
+                                        if uploaded_file is not None
+                                        else report.document_meta.file_name
+                                    )
+                                    rag_client = OpenAIClient(
+                                        embedding_provider=embedding_provider
+                                    )
+                                    rag_context = _build_rag_context_for_diagnosis(
+                                        rag_client,
+                                        normalized["pages"],
+                                        report,
+                                        source_name,
+                                        st.session_state["file_hash"],
+                                        lang,
+                                        embedding_provider,
+                                        st.session_state.get("username"),
+                                        owner_key,
+                                    )
+                                    prompt = _build_ai_diag_prompt(
+                                        internal_payload, rag_context, lang
+                                    )
+                                    gpt_payload = None
+                                    gemini_payload = None
+                                    gpt_critique = None
+                                    gemini_critique = None
+                                    if gpt_ok:
+                                        gpt_payload, ai_diag_errors["gpt"] = _run_gpt_diagnosis(
+                                            prompt
+                                        )
+                                    if gemini_ok:
+                                        gemini_payload, ai_diag_errors["gemini"] = _run_gemini_diagnosis(
+                                            prompt
+                                        )
+                                    scores = [
+                                        payload.get("overall_score")
+                                        for payload in (gpt_payload, gemini_payload)
+                                        if payload and isinstance(payload.get("overall_score"), int)
+                                    ]
+                                    average_score = (
+                                        int(sum(scores) / len(scores)) if scores else None
+                                    )
+                                    if gpt_payload and gemini_payload:
+                                        gpt_critique, _ = _run_gpt_critique(
+                                            gpt_payload, gemini_payload
+                                        )
+                                        gemini_critique, _ = _run_gemini_critique(
+                                            gemini_payload, gpt_payload
+                                        )
+                                    final_payload = None
+                                    if gpt_payload or gemini_payload:
+                                        final_prompt = _build_ai_final_prompt(
+                                            internal_payload,
+                                            rag_context,
+                                            gpt_payload,
+                                            gemini_payload,
+                                            gpt_critique,
+                                            gemini_critique,
+                                            average_score,
+                                            lang,
+                                        )
+                                        if gpt_ok:
+                                            final_payload, ai_diag_errors["final"] = _run_gpt_diagnosis(
+                                                final_prompt
+                                            )
+                                        if final_payload is None and gemini_ok:
+                                            final_payload, ai_diag_errors["final"] = _run_gemini_diagnosis(
+                                                final_prompt
+                                            )
+                                    if final_payload is None:
+                                        final_payload = _merge_ai_results(
+                                            gpt_payload, gemini_payload
+                                        )
+                                    ai_diag_result = {
+                                        "final": final_payload,
+                                        "gpt": gpt_payload,
+                                        "gemini": gemini_payload,
+                                        "gpt_critique": gpt_critique,
+                                        "gemini_critique": gemini_critique,
+                                        "average_score": average_score,
+                                        "rag_context": rag_context,
+                                    }
+                                    ai_diag_status = "ok" if final_payload else "error"
+                                    st.session_state["last_ai_diag_ts"] = time.time()
+                                    st.session_state["ai_diag_cache"][diag_cache_key] = {
+                                        "ai_diag_result": ai_diag_result,
+                                        "ai_diag_status": ai_diag_status,
+                                        "ai_diag_errors": ai_diag_errors,
+                                    }
                 elif mode_key == "anti":
                     from documind.anti.ingest.pdf_loader import load_pdf_with_ocr
                     from documind.anti.ingest.splitter import split_docs
@@ -2366,6 +3316,9 @@ with st.container():
                 st.session_state["ai_candidates"] = ai_candidates
                 st.session_state["ai_status"] = ai_status
                 st.session_state["ai_errors"] = ai_errors
+                st.session_state["ai_diag_result"] = ai_diag_result
+                st.session_state["ai_diag_status"] = ai_diag_status
+                st.session_state["ai_diag_errors"] = ai_diag_errors
                 
                 # Save Analysis History to DB
                 if uploaded_file and st.session_state.get("file_hash"):
@@ -2676,17 +3629,79 @@ with st.container():
         else:
             meta = report.document_meta
             issues = report.issues
+            ai_diag = st.session_state.get("ai_diag_result") or {}
+            ai_final = ai_diag.get("final") if isinstance(ai_diag, dict) else None
+            ai_issues = (
+                ai_final.get("issues")
+                if isinstance(ai_final, dict)
+                else None
+            )
+            use_ai = bool(ai_final and isinstance(ai_issues, list))
             score_display = (
-                report.overall_score if report.overall_score is not None else t["score_na"]
+                ai_final.get("overall_score")
+                if use_ai and ai_final.get("overall_score") is not None
+                else (
+                    report.overall_score
+                    if report.overall_score is not None
+                    else t["score_na"]
+                )
             )
-            actionable_count = sum(
-                1 for issue in issues if issue.kind in {"ERROR", "WARNING"}
-            )
+            if use_ai:
+                actionable_count = sum(
+                    1
+                    for issue in ai_issues
+                    if issue.get("severity") in {"RED", "YELLOW"}
+                )
+                total_issue_count = len(ai_issues)
+            else:
+                actionable_count = sum(
+                    1 for issue in issues if issue.kind in {"ERROR", "WARNING"}
+                )
+                total_issue_count = len(issues)
             metric_left, metric_mid, metric_right, metric_extra = st.columns(4, gap="small")
             metric_left.metric(t["score_label"], score_display)
             metric_mid.metric(t["confidence_label"], report.score_confidence)
             metric_right.metric(t["actionable_count_label"], actionable_count)
-            metric_extra.metric(t["issue_count_label"], len(issues))
+            metric_extra.metric(t["issue_count_label"], total_issue_count)
+
+            if use_ai:
+                st.subheader(t["ai_diag_title"])
+                st.caption(t["ai_diag_caption"])
+                summary_text = (
+                    ai_final.get("summary_en", "")
+                    if lang == "en"
+                    else ai_final.get("summary_ko", "")
+                )
+                if summary_text:
+                    st.write(summary_text)
+                notes_text = (
+                    ai_final.get("consensus_notes_en", "")
+                    if lang == "en"
+                    else ai_final.get("consensus_notes_ko", "")
+                )
+                if notes_text:
+                    st.caption(f"{t['ai_diag_consensus_notes']}: {notes_text}")
+            else:
+                gpt_ok = _gpt_available()
+                gemini_ok = _gemini_available()
+                if not gpt_ok and not gemini_ok:
+                    st.info(t["ai_diag_missing_key"])
+                elif not gpt_ok:
+                    st.info(
+                        t["ai_diag_partial_key"].format(
+                            provider="GPT", fallback="Gemini"
+                        )
+                    )
+                elif not gemini_ok:
+                    st.info(
+                        t["ai_diag_partial_key"].format(
+                            provider="Gemini", fallback="GPT"
+                        )
+                    )
+                final_error = (st.session_state.get("ai_diag_errors") or {}).get("final")
+                if final_error:
+                    message = _ai_error_message(final_error, lang) or t["ai_diag_unavailable"]
+                    st.warning(message)
 
             if meta.scan_level in {"HIGH", "PARTIAL"}:
                 st.warning(t["scan_caution"])
@@ -2694,12 +3709,72 @@ with st.container():
             if report.overall_score is None:
                 st.warning(t["low_confidence_warning"])
 
+            severity_groups = {"RED": [], "YELLOW": [], "GREEN": []}
+            if use_ai:
+                for issue in ai_issues:
+                    severity = issue.get("severity")
+                    if severity in severity_groups:
+                        severity_groups[severity].append(issue)
+            else:
+                for issue in issues:
+                    if issue.severity in severity_groups:
+                        severity_groups[issue.severity].append(issue)
+            st.subheader(t["severity_breakdown_title"])
+            st.caption(t["severity_breakdown_caption"])
+            for severity in ("RED", "YELLOW", "GREEN"):
+                icon = SEVERITY_ICONS.get(severity, "")
+                label = _severity_label(severity, lang, show_raw=False)
+                grouped = severity_groups.get(severity, [])
+                if not grouped:
+                    st.caption(f"{icon} {label}: 0")
+                    continue
+                with st.expander(
+                    f"{icon} {label} ({len(grouped)})", expanded=(severity == "RED")
+                ):
+                    lines = []
+                    for issue in grouped:
+                        if use_ai:
+                            category_label = _category_label(
+                                issue.get("category"), lang
+                            )
+                            message = (
+                                issue.get("message_en", "")
+                                if lang == "en"
+                                else issue.get("message_ko", "")
+                            )
+                            suggestion = (
+                                issue.get("suggestion_en", "")
+                                if lang == "en"
+                                else issue.get("suggestion_ko", "")
+                            )
+                            page = issue.get("page", 0)
+                            lines.append(
+                                f"- p{page} · {category_label} · {message} → {suggestion}"
+                            )
+                        else:
+                            category_label = _category_label(issue.category, lang)
+                            action_text = _issue_action(issue, lang)
+                            lines.append(
+                                f"- p{issue.location.page} · {category_label} · "
+                                f"{issue.message} → {action_text}"
+                            )
+                    st.markdown("\n".join(lines))
+
     with issues_tab:
         if report is None:
             _render_empty_state(t["no_report"])
         else:
             meta = report.document_meta
             issues = report.issues
+            ai_diag = st.session_state.get("ai_diag_result") or {}
+            ai_final = ai_diag.get("final") if isinstance(ai_diag, dict) else None
+            ai_issues = (
+                ai_final.get("issues")
+                if isinstance(ai_final, dict)
+                else None
+            )
+            if isinstance(ai_issues, list) and ai_issues:
+                issues = _convert_ai_issues(ai_issues, lang)
             page_type_map = {profile.page: profile.type for profile in meta.page_profiles}
 
             categories = sorted({issue.category for issue in issues})
@@ -2950,6 +4025,47 @@ with st.container():
         if report is None:
             _render_empty_state(t["no_report"])
         else:
+            ai_diag = st.session_state.get("ai_diag_result") or {}
+            ai_final = ai_diag.get("final") if isinstance(ai_diag, dict) else None
+            if isinstance(ai_final, dict):
+                st.subheader(t["ai_diag_title"])
+                diag_text = (
+                    ai_final.get("diagnostics_en", "")
+                    if lang == "en"
+                    else ai_final.get("diagnostics_ko", "")
+                )
+                if diag_text:
+                    st.write(diag_text)
+                notes_text = (
+                    ai_final.get("consensus_notes_en", "")
+                    if lang == "en"
+                    else ai_final.get("consensus_notes_ko", "")
+                )
+                if notes_text:
+                    st.caption(f"{t['ai_diag_consensus_notes']}: {notes_text}")
+                gpt_payload = ai_diag.get("gpt")
+                gemini_payload = ai_diag.get("gemini")
+                gpt_critique = ai_diag.get("gpt_critique")
+                gemini_critique = ai_diag.get("gemini_critique")
+                if gpt_payload or gemini_payload:
+                    with st.expander(t["ai_diag_gpt_label"]):
+                        if gpt_payload:
+                            st.json(gpt_payload)
+                        else:
+                            st.info(t["ai_diag_unavailable"])
+                    with st.expander(t["ai_diag_gemini_label"]):
+                        if gemini_payload:
+                            st.json(gemini_payload)
+                        else:
+                            st.info(t["ai_diag_unavailable"])
+                if gpt_critique or gemini_critique:
+                    with st.expander(t["ai_diag_critique_label"]):
+                        if gpt_critique:
+                            st.write("GPT")
+                            st.json(gpt_critique)
+                        if gemini_critique:
+                            st.write("Gemini")
+                            st.json(gemini_critique)
             meta = report.document_meta
             metric_items = [
                 (t["page_count_label"], meta.page_count),
@@ -3075,27 +4191,55 @@ with st.container():
                             st.session_state["file_hash"] = hashlib.sha256(
                                 uploaded_file.getvalue()
                             ).hexdigest()[:12]
-                        rag_key = _rag_cache_key(st.session_state["file_hash"], lang)
-                        rag_index = st.session_state["rag_index_cache"].get(rag_key)
-                        if rag_index is None:
-                            client = OpenAIClient()
-                            rag_index = build_index(
-                                client, 
-                                normalized_pages,
-                                user_id=st.session_state["username"]
+                        embedding_provider = st.session_state.get("embedding_provider") or "OpenAI"
+                        rag_key = _rag_cache_key(
+                            st.session_state["file_hash"], lang, embedding_provider
+                        )
+                        rag_state = st.session_state["rag_index_cache"].get(rag_key)
+                        owner_key = _rag_owner_key(
+                            st.session_state.get("username"),
+                            st.session_state["file_hash"],
+                            lang,
+                            embedding_provider,
+                        )
+                        if rag_state is None:
+                            client = OpenAIClient(embedding_provider=embedding_provider)
+                            source_name = (
+                                uploaded_file.name
+                                if uploaded_file is not None
+                                else report.document_meta.file_name
                             )
-                            if rag_index is None:
+                            rag_collection = _build_chroma_index(
+                                client,
+                                normalized_pages,
+                                owner_key,
+                                source_name,
+                                st.session_state["file_hash"],
+                                lang,
+                                embedding_provider,
+                                st.session_state.get("username"),
+                            )
+                            if rag_collection is None:
                                 st.session_state["rag_status"] = "error"
-                                st.session_state["rag_error"] = client.last_error
+                                st.session_state["rag_error"] = client.last_error or "rag_index_failed"
                             else:
-                                st.session_state["rag_index_cache"][rag_key] = rag_index
-                        if rag_index is not None:
-                            client = OpenAIClient()
+                                rag_state = {"owner_key": owner_key}
+                                st.session_state["rag_index_cache"][rag_key] = rag_state
+                        if rag_state is not None:
+                            client = OpenAIClient(embedding_provider=embedding_provider)
+                            rag_collection = _get_chroma_collection()
                             top_k = _rag_top_k(
                                 normalized_pages, report.document_meta.scan_level
                             )
                             def _rag_status(stage: str) -> None:
-                                if stage == "search":
+                                if stage == "rewrite":
+                                    rag_status_placeholder.markdown(
+                                        _rag_processing_html(
+                                            t["qa_processing_rewrite"]
+                                        ),
+                                        unsafe_allow_html=True,
+                                    )
+                                elif stage == "search":
                                     rag_status_placeholder.markdown(
                                         _rag_processing_html(
                                             t["qa_processing_search"]
@@ -3113,13 +4257,15 @@ with st.container():
                                 client,
                                 question,
                                 normalized_pages,
-                                rag_index,
+                                rag_collection,
+                                owner_key,
                                 top_k,
                                 lang,
                                 report.document_meta.scan_level,
                                 status_callback=_rag_status,
-                                user_filter=st.session_state["username"],
-                                is_admin=(st.session_state["role"] == "admin")
+                                file_hash=st.session_state["file_hash"],
+                                embedding_provider=embedding_provider,
+                                is_admin=(st.session_state["role"] == "admin"),
                             )
                             st.session_state["rag_last_question"] = question
                             st.session_state["rag_last_result"] = result
@@ -3239,6 +4385,9 @@ with st.container():
                         },
                         "ai_explanations": ai_explanations or {},
                         "ai_candidates": ai_candidates or [],
+                        "ai_diagnosis": st.session_state.get("ai_diag_result"),
+                        "ai_diagnosis_status": st.session_state.get("ai_diag_status"),
+                        "ai_diagnosis_errors": st.session_state.get("ai_diag_errors"),
                         "rag": {
                             "question": st.session_state.get("rag_last_question"),
                             "answer": (
