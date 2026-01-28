@@ -16,31 +16,24 @@ def _get_embedding():
 
 def save_raw_docs(docs):
     patch_pydantic_v1_for_chromadb()
-    import chromadb
-    
-    # ChromaDB 0.4+ style persistence
-    client = chromadb.PersistentClient(path=PERSIST_DIR)
-    
-    # Use 'langchain' collection to match previous behavior
-    collection = client.get_or_create_collection(name="langchain")
-    
-    texts = [doc.page_content for doc in docs]
-    metadatas = [doc.metadata for doc in docs]
-    # Simple ID generation
-    import uuid
-    ids = [str(uuid.uuid4()) for _ in docs]
-    
-    collection.add(
-        documents=texts,
-        metadatas=metadatas,
-        ids=ids
+    from langchain_community.vectorstores import Chroma
+
+    embedding = _get_embedding()
+    db = Chroma(
+        persist_directory=PERSIST_DIR,
+        embedding_function=embedding,
+        collection_name="langchain",
     )
-    # PersistentClient auto-persists, no need to call persist()
-        
-    return collection
+    db.add_documents(docs)
+    return db
 
 def get_chroma():
     patch_pydantic_v1_for_chromadb()
-    import chromadb
+    from langchain_community.vectorstores import Chroma
 
-    return chromadb.PersistentClient(path=PERSIST_DIR)
+    embedding = _get_embedding()
+    return Chroma(
+        persist_directory=PERSIST_DIR,
+        embedding_function=embedding,
+        collection_name="langchain",
+    )
