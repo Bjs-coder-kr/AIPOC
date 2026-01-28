@@ -5,10 +5,31 @@ Exportable Module for quality assurance through iterative generation and evaluat
 """
 
 import logging
+from dataclasses import dataclass
+
 from ..llm import call_llm, LLM_CONFIG
 from ..utils.json_utils import extract_json
 
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════
+# State Model
+# ═══════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class OptimizerState:
+    attempt: int
+    max_retries: int
+    current_score: int
+    current_text: str
+    feedback: str
+    status: str
+    decision_required: bool
+    best_score: int = 0
+    best_text: str = ""
+    best_feedback: str = ""
+    message: str = ""
 
 # ═══════════════════════════════════════════════════════════════════
 # Actor-Critic Engine
@@ -69,6 +90,10 @@ def generate_with_critic_loop(
     context_text, 
     context_type="Summary", 
     max_retries=None, 
+    extra_retries=None,
+    min_score_for_extra=None,
+    pass_threshold=None,
+    check_threshold=None,
     progress_callback=None, 
     critic_provider=None, 
     critic_prompt_factory=None, 
@@ -92,35 +117,77 @@ def generate_with_critic_loop(
         critic_prompt_factory: Custom prompt factory for critic
         persona_guide: Persona guide dict for tone evaluation
     
-    Returns:
-        Best generated text
+    Yields:
+        OptimizerState
     """
     # Load config
     analysis_config = LLM_CONFIG.get("analysis", {})
-    max_retries = max_retries or analysis_config.get("max_retries", 3)
-    score_threshold = analysis_config.get("score_threshold", 90)
+    max_retries = max_retries or analysis_config.get("max_retries", 5)
+    extra_retries = extra_retries or analysis_config.get("extra_retries", 3)
+    min_score_for_extra = min_score_for_extra or analysis_config.get("min_score_for_extra", 75)
+    pass_threshold = pass_threshold or analysis_config.get("pass_threshold", 90)
+    check_threshold = check_threshold or analysis_config.get("check_threshold", 85)
+    archive_threshold = analysis_config.get("archive_threshold", 95)
 
     critic_provider = critic_provider or actor_provider 
     
-    current_prompt = prompt_template.format(text=context_text)
+    current_prompt = prompt_template.replace("{text}", context_text)
     
     logger.info(f"🚀 [Start] Actor: {actor_provider}, Critic: {critic_provider}")
     if progress_callback:
         progress_callback("start", 0, max_retries, 0, "", f"Actor: {actor_provider}, Critic: {critic_provider}")
     
-    history = []
+    def _build_refine_prompt(score, feedback):
+        persona_reminder = ""
+        if persona_guide:
+            persona_reminder = f"\n(Required tone: {persona_guide.get('tone')})"
+        return f"""
+        The previous draft received a score ({score}).
+        
+        [Critic Feedback]
+        {feedback}
+        {persona_reminder}
+        
+        [Instructions]
+        Rewrite the draft incorporating the feedback above.
+        Output only the final revised version.
+        
+        [Original Text]
+        {context_text}
+        """
 
-    for i in range(max_retries):
+    history = []
+    total_retries = max_retries
+    extra_used = False
+    bonus_used = False
+    attempt = 0
+    auto_run_enabled = False
+
+    while attempt < total_retries:
         # 1. Generate (Actor)
-        logger.info(f"  🎬 [{i+1}/{max_retries}] Actor Generating...")
+        logger.info(f"  🎬 [{attempt+1}/{total_retries}] Actor Generating...")
         if progress_callback:
-            progress_callback("generating", i+1, max_retries, 0, "", f"🎬 [{i+1}/{max_retries}] Actor generating...")
+            progress_callback(
+                "generating",
+                attempt + 1,
+                total_retries,
+                0,
+                "",
+                f"🎬 [{attempt+1}/{total_retries}] Actor generating...",
+            )
         draft = call_llm(actor_provider, current_prompt)
         
         # 2. Evaluate (Critic)
-        logger.info(f"  🧐 [{i+1}/{max_retries}] Critic Evaluating...")
+        logger.info(f"  🧐 [{attempt+1}/{total_retries}] Critic Evaluating...")
         if progress_callback:
-            progress_callback("evaluating", i+1, max_retries, 0, "", f"🧐 [{i+1}/{max_retries}] Critic evaluating...")
+            progress_callback(
+                "evaluating",
+                attempt + 1,
+                total_retries,
+                0,
+                "",
+                f"🧐 [{attempt+1}/{total_retries}] Critic evaluating...",
+            )
             
         eval_result = call_critic(critic_provider, draft, context_type, prompt_factory=critic_prompt_factory, persona_guide=persona_guide)
         
@@ -128,55 +195,228 @@ def generate_with_critic_loop(
         feedback = eval_result.get("feedback", "No feedback")
         
         history.append({"score": score, "draft": draft, "feedback": feedback})
+        best_attempt = max(reversed(history), key=lambda x: x["score"])
+        best_score = best_attempt["score"]
         
         logger.info(f"    👉 Score: {score}, Feedback: {feedback}")
         if progress_callback:
-            progress_callback("evaluated", i+1, max_retries, score, feedback, f"👉 Score: {score}/100")
+            progress_callback(
+                "evaluated",
+                attempt + 1,
+                total_retries,
+                score,
+                feedback,
+                f"👉 Score: {score}/100",
+            )
         
-        # 3. Check Threshold
-        if score >= score_threshold:
-            logger.info(f"  ✅ Passed! ({score} >= {score_threshold})")
+        # 3. Bonus try to reach archive threshold if already passing
+        if score >= pass_threshold and not bonus_used:
+            bonus_used = True
+            if attempt + 1 >= total_retries:
+                total_retries += 1
+            logger.info(
+                "  🔁 Pass reached. Retesting after refinement for %s+.",
+                archive_threshold,
+            )
             if progress_callback:
-                progress_callback("passed", i+1, max_retries, score, feedback, f"✅ Passed! ({score} >= {score_threshold})")
-            return draft
-        
-        # Warn if score dropping
-        if i > 0 and score < history[i-1]["score"]:
-            logger.warning(f"    ⚠️ Warning: Score dropped ({history[i-1]['score']} -> {score})")
-            
-        # 4. Refine Prompt
-        if i < max_retries - 1:
-            logger.info(f"  🔄 Retrying... (Score {score} < {score_threshold})")
-            if progress_callback:
-                progress_callback("refining", i+1, max_retries, score, feedback, f"🔄 Retrying... ({score} < {score_threshold})")
-            
-            persona_reminder = ""
-            if persona_guide:
-                 persona_reminder = f"\n(Required tone: {persona_guide.get('tone')})"
+                progress_callback(
+                    "refining",
+                    attempt + 1,
+                    total_retries,
+                    score,
+                    feedback,
+                    f"🔁 Retesting for {archive_threshold}+ ...",
+                )
+            state = OptimizerState(
+                attempt=attempt + 1,
+                max_retries=total_retries,
+                current_score=score,
+                current_text=draft,
+                feedback=feedback,
+                status="REFINE_FOR_95",
+                decision_required=False,
+                best_score=best_score,
+                best_text=best_attempt["draft"],
+                best_feedback=best_attempt["feedback"],
+                message=f"REFINE_FOR_{archive_threshold}",
+            )
+            yield state
+            current_prompt = _build_refine_prompt(score, feedback)
+            attempt += 1
+            continue
 
-            current_prompt = f"""
-            The previous draft received a low score ({score}).
-            
-            [Critic Feedback]
-            {feedback}
-            {persona_reminder}
-            
-            [Instructions]
-            Rewrite the draft incorporating the feedback above.
-            Output only the final revised version.
-            
-            [Original Text]
-            {context_text}
-            """
-            
-    # Best-of-N selection
-    best_attempt = max(history, key=lambda x: x["score"])
+        # 4a. Rollback check: If bonus attempt was used but score dropped, return best result
+        if bonus_used and score < best_score:
+            logger.warning(
+                "  ⚠️ Score dropped after bonus attempt (%s -> %s). Rolling back to best result.",
+                best_score,
+                score,
+            )
+            if progress_callback:
+                progress_callback(
+                    "rollback",
+                    attempt + 1,
+                    total_retries,
+                    best_score,
+                    best_attempt["feedback"],
+                    f"⚠️ Rollback to best score ({best_score})",
+                )
+            rollback_state = OptimizerState(
+                attempt=attempt + 1,
+                max_retries=total_retries,
+                current_score=best_score,
+                current_text=best_attempt["draft"],
+                feedback=best_attempt["feedback"],
+                status="PASS",
+                decision_required=False,
+                best_score=best_score,
+                best_text=best_attempt["draft"],
+                best_feedback=best_attempt["feedback"],
+                message=f"ROLLBACK_TO_BEST ({best_score})",
+            )
+            return rollback_state
+
+        # 4. Status determination
+        status = "FAIL"
+        decision_required = False
+        message = ""
+        if score >= pass_threshold:
+            status = "PASS"
+            message = "PASS"
+            logger.info(f"  ✅ Passed! ({score} >= {pass_threshold})")
+            if progress_callback:
+                progress_callback(
+                    "passed",
+                    attempt + 1,
+                    total_retries,
+                    score,
+                    feedback,
+                    f"✅ Passed! ({score} >= {pass_threshold})",
+                )
+        elif check_threshold <= score < pass_threshold:
+            if not auto_run_enabled:
+                status = "WAIT_CONFIRM"
+                decision_required = True
+                message = f"WAIT_CONFIRM ({score})"
+                # If auto_run is enabled, we treat this as a "fail" (continue refining) 
+                # effectively falling through to the retry logic below.
+
+        # Warn if score dropping
+        if attempt > 0 and score < history[attempt - 1]["score"]:
+            logger.warning(
+                f"    ⚠️ Warning: Score dropped ({history[attempt-1]['score']} -> {score})"
+            )
+
+        state = OptimizerState(
+            attempt=attempt + 1,
+            max_retries=total_retries,
+            current_score=score,
+            current_text=draft,
+            feedback=feedback,
+            status=status,
+            decision_required=decision_required,
+            best_score=best_score,
+            best_text=best_attempt["draft"],
+            best_feedback=best_attempt["feedback"],
+            message=message,
+        )
+
+        decision = None
+        if decision_required:
+            decision = yield state
+        else:
+            yield state
+
+        if status == "PASS":
+            return state
+
+        if status == "WAIT_CONFIRM":
+            if decision == "accept":
+                state.status = "PASS"
+                state.decision_required = False
+                state.message = "ACCEPTED"
+                return state
+            if decision == "auto_run":
+                auto_run_enabled = True
+                decision = "retry"  # Continue as retry
+                
+            if decision != "retry":
+                decision = "retry"
+
+        attempt += 1
+
+        # Extend retries if needed
+        if attempt >= total_retries:
+            if not extra_used and best_score < min_score_for_extra and extra_retries > 0:
+                total_retries += extra_retries
+                extra_used = True
+                logger.info(
+                    "  ➕ Extending retries (best=%s < %s) -> total %s",
+                    best_score,
+                    min_score_for_extra,
+                    total_retries,
+                )
+            else:
+                if status == "WAIT_CONFIRM" and decision == "retry":
+                    state.status = "PASS"
+                    state.decision_required = False
+                    state.message = "ACCEPTED_NO_RETRIES"
+                    return state
+                break
+
+        # 5. Refine Prompt
+        logger.info(f"  🔄 Retrying... (Score {score} < {pass_threshold})")
+        if progress_callback:
+            progress_callback(
+                "refining",
+                attempt,
+                total_retries,
+                score,
+                feedback,
+                f"🔄 Retrying... ({score} < {pass_threshold})",
+            )
+
+        current_prompt = _build_refine_prompt(score, feedback)
+
+    # Best-of-N selection: favor latest attempt on ties
+    best_attempt = max(reversed(history), key=lambda x: x["score"])
     best_score = best_attempt["score"]
     best_draft = best_attempt["draft"]
     best_feedback = best_attempt["feedback"]
-    
+
     msg = f"⚠️ Below threshold (Best: {best_score}/100)"
     if progress_callback:
-        progress_callback("failed", max_retries, max_retries, best_score, best_feedback, msg)
+        progress_callback(
+            "failed",
+            total_retries,
+            total_retries,
+            best_score,
+            best_feedback,
+            msg,
+        )
 
-    return best_draft
+    final_state = OptimizerState(
+        attempt=total_retries,
+        max_retries=total_retries,
+        current_score=best_score,
+        current_text=best_draft,
+        feedback=best_feedback,
+        status="FAIL",
+        decision_required=False,
+        best_score=best_score,
+        best_text=best_draft,
+        best_feedback=best_feedback,
+        message=msg,
+    )
+
+    if check_threshold <= best_score < pass_threshold:
+        final_state.status = "WAIT_CONFIRM"
+        final_state.decision_required = True
+        decision = yield final_state
+        if decision == "accept":
+            final_state.status = "PASS"
+            final_state.decision_required = False
+            final_state.message = "ACCEPTED"
+        return final_state
+
+    return final_state

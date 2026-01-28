@@ -59,8 +59,13 @@ LLM_CONFIG = {
     # Actor-Critic Loop Settings
     # ═══════════════════════════════════════════════════════════════════
     "analysis": {
-        "max_retries": 3,           # Actor-Critic retry count
-        "score_threshold": 90,      # Pass threshold score
+        "max_retries": 5,             # Actor-Critic retry count (primary)
+        "extra_retries": 3,           # Extra retries if quality is too low
+        "min_score_for_extra": 75,    # Trigger extra retries if best < this
+        "pass_threshold": 90,         # Auto-pass threshold
+        "check_threshold": 85,        # Interactive confirm range lower bound
+        "archive_threshold": 95,      # Auto-archive threshold
+        "score_threshold": 90,        # Legacy: pass threshold score
         "default_provider": "Gemini CLI"
     }
 }
@@ -80,9 +85,14 @@ def get_api_model(provider: str) -> str:
 def get_analysis_config() -> dict:
     """Get analysis settings with defaults."""
     defaults = {
-        "max_retries": 3,
+        "max_retries": 5,
+        "extra_retries": 3,
+        "min_score_for_extra": 75,
+        "pass_threshold": 90,
+        "check_threshold": 85,
+        "archive_threshold": 95,
         "score_threshold": 90,
-        "default_provider": "Gemini CLI"
+        "default_provider": "Gemini CLI",
     }
     config = LLM_CONFIG.get("analysis", {})
     return {**defaults, **config}
@@ -107,6 +117,11 @@ AVAILABLE_EMBEDDING_PROVIDERS = [
     "Ollama"
 ]
 
+DEFAULT_EMBEDDING_PROVIDER = os.getenv(
+    "DEFAULT_EMBEDDING_PROVIDER",
+    AVAILABLE_EMBEDDING_PROVIDERS[0] if AVAILABLE_EMBEDDING_PROVIDERS else "",
+)
+
 
 def get_available_providers() -> list[str]:
     """
@@ -123,6 +138,13 @@ def get_available_embedding_providers() -> list[str]:
     return AVAILABLE_EMBEDDING_PROVIDERS.copy()
 
 
+def get_default_embedding_provider() -> str:
+    """Get default embedding provider."""
+    if DEFAULT_EMBEDDING_PROVIDER in AVAILABLE_EMBEDDING_PROVIDERS:
+        return DEFAULT_EMBEDDING_PROVIDER
+    return AVAILABLE_EMBEDDING_PROVIDERS[0] if AVAILABLE_EMBEDDING_PROVIDERS else ""
+
+
 def get_default_actor_provider() -> str:
     """Get default actor (generation) provider."""
     return LLM_CONFIG.get("analysis", {}).get("default_provider", "Gemini CLI")
@@ -131,4 +153,3 @@ def get_default_actor_provider() -> str:
 def get_default_critic_provider() -> str:
     """Get default critic (evaluation) provider."""
     return "Claude CLI"  # Default to different provider for diversity
-

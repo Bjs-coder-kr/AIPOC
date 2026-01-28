@@ -11,8 +11,10 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 def create_txt_bytes(text: str) -> bytes:
-    """Create TXT file bytes."""
-    return text.encode("utf-8")
+    """Create TXT file bytes with UTF-8 BOM for better compatibility."""
+    # UTF-8 BOM helps Korean text display correctly in Windows Notepad and similar editors
+    UTF8_BOM = b'\xef\xbb\xbf'
+    return UTF8_BOM + text.encode("utf-8")
 
 def create_docx_bytes(text: str) -> bytes:
     """Create DOCX file bytes."""
@@ -40,16 +42,24 @@ def create_pdf_bytes(text: str) -> bytes:
     # Register Korean Font (NanumGothic TTF)
     font_name = 'NanumGothic'
     try:
-        # Assuming AIPOC/assets/fonts/NanumGothic.ttf exists relative to the current working directory
-        # We need absolute path or correct relative path. 
-        # Since we run from "Project AI POC" (root), and file is in "AIPOC/assets/fonts/..."
-        # We'll try to find it.
+        # Resolve path relative to this file: export.py is in documind/utils/
+        # Assets are in assets/fonts/ (root/assets/fonts)
+        # So we go up 2 levels (documind/utils -> documind -> root)
+        from pathlib import Path
         import os
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # AIPOC root
-        font_path = os.path.join(base_dir, "assets", "fonts", "NanumGothic.ttf")
         
-        from reportlab.pdfbase.ttfonts import TTF
-        pdfmetrics.registerFont(TTF(font_name, font_path))
+        current_file = Path(__file__).resolve()
+        project_root = current_file.parents[2]  # documind/utils -> documind -> root
+        font_path = project_root / "assets" / "fonts" / "NanumGothic.ttf"
+        
+        if not font_path.exists():
+             # Try one level up if in documind/app case? No, structure is fixed.
+             # Just log if missing
+             print(f"Font not found at: {font_path}")
+             raise FileNotFoundError(f"Font missing: {font_path}")
+
+        from reportlab.pdfbase.ttfonts import TTFont
+        pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
     except Exception as e:
         # Fallback to CID if TTF fails
         print(f"Font loading failed: {e}")
