@@ -105,6 +105,9 @@ I18N = {
         "anti_question_label": "문서에 대해 질문하세요",
         "anti_answer_title": "답변",
         "anti_analysis_title": "문서 분석",
+        "anti_action_label": "분석 선택",
+        "anti_run_button": "실행",
+        "anti_result_title": "분석 결과",
         "anti_summary_button": "핵심 요약",
         "anti_antithesis_button": "안티테제 (비판 분석)",
         "anti_revision_button": "개선된 문서 재작성",
@@ -299,6 +302,9 @@ I18N = {
         "anti_question_label": "Ask a question about the document",
         "anti_answer_title": "Answer",
         "anti_analysis_title": "Document analysis",
+        "anti_action_label": "Analysis",
+        "anti_run_button": "Run",
+        "anti_result_title": "Result",
         "anti_summary_button": "Summary",
         "anti_antithesis_button": "Antithesis (critical analysis)",
         "anti_revision_button": "Rewritten document",
@@ -1011,6 +1017,18 @@ if "anti_llm" not in st.session_state:
     st.session_state["anti_llm"] = None
 if "anti_retriever" not in st.session_state:
     st.session_state["anti_retriever"] = None
+if "anti_top_k" not in st.session_state:
+    st.session_state["anti_top_k"] = 3
+if "anti_chunk_size" not in st.session_state:
+    st.session_state["anti_chunk_size"] = 500
+if "anti_chunk_overlap" not in st.session_state:
+    st.session_state["anti_chunk_overlap"] = 100
+if "anti_last_params" not in st.session_state:
+    st.session_state["anti_last_params"] = None
+if "anti_prev_result" not in st.session_state:
+    st.session_state["anti_prev_result"] = None
+if "anti_prev_params" not in st.session_state:
+    st.session_state["anti_prev_params"] = None
 
 try:
     AI_COOLDOWN_SECONDS = max(0, int(os.getenv("AI_COOLDOWN_SECONDS", "20")))
@@ -2414,7 +2432,7 @@ def _get_anti_retriever():
     try:
         save_raw_docs(chunks)
         db = get_chroma()
-        retriever = db.as_retriever(search_kwargs={"k": 3})
+        retriever = db.as_retriever(search_kwargs={"k": st.session_state.get("anti_top_k", 3)})
     except Exception as exc:
         st.session_state["anti_error"] = f"vectorstore_failed:{exc.__class__.__name__}"
         return None, None
@@ -2791,7 +2809,14 @@ with st.container():
             mode_key = menu
             
             # Display current mode title for clarity
-            st.subheader(t.get(f"menu_{mode_key}", mode_key))
+            mode_title = t.get(f"menu_{mode_key}", mode_key)
+            if mode_key == "anti":
+                st.markdown(
+                    f"<div style='font-size:1.1rem;font-weight:700;margin:0.1rem 0 0.4rem 0;'>{mode_title}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.subheader(mode_title)
 
             if mode_key == "quality" and ai_available:
                 ai_explain_enabled = st.toggle(
@@ -3206,7 +3231,11 @@ with st.container():
                                         metadata={"page": p["page_number"], "source": uploaded_file.name}
                                     ))
                             
-                        chunks = split_docs(docs)
+                        chunks = split_docs(
+                            docs,
+                            chunk_size=st.session_state.get("anti_chunk_size", 500),
+                            chunk_overlap=st.session_state.get("anti_chunk_overlap", 100),
+                        )
                         st.session_state["anti_docs"] = docs
                         st.session_state["anti_chunks"] = chunks
                         st.session_state["anti_indexed"] = True
@@ -3354,63 +3383,320 @@ with st.container():
                 with st.expander(f"{label} | Page {page}"):
                     st.text(doc.page_content[:3000])
 
-            question = st.text_input(t["anti_question_label"])
-            if question:
-                from documind.anti.rag.chain import get_rag_chain
-
-                llm, retriever = _get_anti_retriever()
-                if not llm or not retriever:
-                    st.stop()
-                rag_chain = get_rag_chain(llm, retriever)
-                with st.spinner("답변 생성 중..." if lang == "ko" else "Generating answer..."):
-                    answer = rag_chain.invoke(question)
-                st.markdown(f"### {t['anti_answer_title']}")
-                st.write(answer)
-
             st.divider()
-            st.subheader(t["anti_analysis_title"])
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if st.button(t["anti_summary_button"]):
-                    from documind.anti.rag.chain import get_rag_chain
+            st.markdown(
+                f"<div style='margin-bottom:6px;font-weight:600;font-size:1.0rem;'>{t['anti_analysis_title']}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stRadio"] { margin-bottom: 0.25rem; }
+                div[data-testid="stRadio"] > div { padding: 0.1rem 0 0.2rem 0; }
+                div[data-testid="stRadio"] [role="radiogroup"] {
+                  gap: 0.35rem;
+                  padding: 0.15rem 0.25rem;
+                  border: 1px solid rgba(250, 250, 250, 0.12);
+                  border-radius: 10px;
+                }
+                div[data-testid="stRadio"] label p { font-size: 0.92rem; }
+                div[data-testid="stButton"] button {
+                  padding: 0.25rem 0.55rem;
+                  min-height: 2.1rem;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            with st.expander("RAG 설정", expanded=False):
+                st.caption("검색 범위와 문서 분할 기준을 조정합니다. 문서가 길수록 효과가 큽니다.")
+                k_value = st.slider("Top-K(검색 개수)", min_value=1, max_value=8, value=int(st.session_state.get("anti_top_k", 3)))
+                st.caption("검색 결과로 가져올 문서 조각 수입니다. 값이 크면 근거가 넓어지고 느려질 수 있어요.")
+                chunk_size_value = st.slider(
+                    "청크 크기", min_value=200, max_value=1500, value=int(st.session_state.get("anti_chunk_size", 500)), step=50
+                )
+                st.caption("문서를 자르는 단위 길이입니다. 작을수록 세밀하지만 문맥이 끊길 수 있어요.")
+                chunk_overlap_value = st.slider(
+                    "청크 겹침", min_value=0, max_value=500, value=int(st.session_state.get("anti_chunk_overlap", 100)), step=25
+                )
+                st.caption("문맥 유지용 겹침 길이입니다. 너무 크면 중복이 늘어납니다.")
+                if st.button("설정 적용", use_container_width=True):
+                    st.session_state["anti_top_k"] = k_value
+                    st.session_state["anti_chunk_size"] = chunk_size_value
+                    st.session_state["anti_chunk_overlap"] = chunk_overlap_value
+                    if st.session_state.get("anti_docs"):
+                        from documind.anti.ingest.splitter import split_docs
+                        st.session_state["anti_chunks"] = split_docs(
+                            st.session_state["anti_docs"],
+                            chunk_size=chunk_size_value,
+                            chunk_overlap=chunk_overlap_value,
+                        )
+                    st.session_state["anti_llm"] = None
+                    st.session_state["anti_retriever"] = None
+                    st.success("RAG 설정이 적용되었습니다.")
+            action_labels = {
+                "antithesis": t["anti_antithesis_button"],
+                "revision": t["anti_revision_button"],
+            }
+            action_col, run_col = st.columns([9, 1])
+            with action_col:
+                selected_action = st.radio(
+                    t["anti_action_label"],
+                    options=list(action_labels.keys()),
+                    format_func=lambda key: action_labels[key],
+                    horizontal=True,
+                    key="anti_action",
+                    label_visibility="collapsed",
+                )
+            with run_col:
+                st.write("")
+                run_clicked = st.button(
+                    t["anti_run_button"],
+                    use_container_width=True,
+                    disabled=st.session_state.get("anti_running", False),
+                )
+            run_clicked = run_clicked or st.session_state.pop("anti_retry_request", False)
 
+            if run_clicked:
+                st.session_state["anti_running"] = True
+                try:
                     llm, retriever = _get_anti_retriever()
                     if not llm or not retriever:
                         st.stop()
-                    rag_chain = get_rag_chain(llm, retriever)
-                    with st.spinner("요약 중..." if lang == "ko" else "Summarizing..."):
-                        answer = rag_chain.invoke("이 문서의 핵심 내용을 요약해줘")
-                    st.write(answer)
-            with col2:
-                if st.button(t["anti_antithesis_button"]):
-                    from documind.anti.rag.chain import get_antithesis_chain
 
-                    llm, retriever = _get_anti_retriever()
-                    if not llm or not retriever:
-                        st.stop()
-                    antithesis_chain = get_antithesis_chain(llm, retriever)
-                    with st.spinner("비판적으로 분석 중..." if lang == "ko" else "Analyzing critically..."):
-                        antithesis = antithesis_chain.invoke("이 문서 전체를 비판적으로 분석해줘")
-                    st.session_state["antithesis"] = antithesis
-                    st.markdown(f"### {t['anti_antithesis_button']}")
-                    st.write(antithesis)
-            with col3:
-                if st.button(t["anti_revision_button"]):
-                    if "antithesis" not in st.session_state:
-                        st.warning(t["anti_revision_missing"])
+                    if selected_action == "antithesis":
+                        from documind.anti.rag.chain import (
+                            get_antithesis_chain,
+                            get_antithesis_critic_chain,
+                            get_antithesis_refine_chain,
+                        )
+                        from documind.anti.rag.claude import get_claude_critic
+
+                        antithesis_chain = get_antithesis_chain(llm, retriever)
+                        with st.spinner("비판적으로 분석 중..." if lang == "ko" else "Analyzing critically..."):
+                            antithesis = antithesis_chain.invoke("이 문서 전체를 비판적으로 분석해줘")
+
+                        critic_llm = get_claude_critic()
+                        critic_chain = get_antithesis_critic_chain(critic_llm, retriever)
+                        refine_chain = get_antithesis_refine_chain(llm, retriever)
+                        max_rounds = 2
+                        score_threshold = 85
+                        review = ""
+                        final_antithesis = antithesis
+                        passed = False
+                        for _ in range(max_rounds):
+                            with st.spinner("검수 중..." if lang == "ko" else "Reviewing..."):
+                                review = critic_chain.invoke(final_antithesis)
+                            verdict_match = re.search(
+                                r"verdict\\s*:\\s*(PASS|FAIL)", review, re.IGNORECASE
+                            )
+                            verdict = verdict_match.group(1).upper() if verdict_match else "PASS"
+                            score_match = re.search(
+                                r"score\\s*:\\s*(\\d+)", review, re.IGNORECASE
+                            )
+                            score = int(score_match.group(1)) if score_match else score_threshold
+                            citations_ok = bool(re.search(r"\(p\d+\)", final_antithesis))
+                            if (verdict == "PASS" or score >= score_threshold) and citations_ok:
+                                passed = True
+                                break
+                            with st.spinner("수정 중..." if lang == "ko" else "Refining..."):
+                                final_antithesis = refine_chain.invoke(
+                                    {"antithesis": final_antithesis, "review": review}
+                                )
+                        st.session_state["antithesis_review"] = review
+                        st.session_state["anti_quality_passed"] = passed
+
+                        st.session_state["antithesis"] = final_antithesis
+                        if st.session_state.get("anti_result"):
+                            st.session_state["anti_prev_result"] = st.session_state["anti_result"]
+                            st.session_state["anti_prev_params"] = st.session_state.get("anti_last_params")
+                        st.session_state["anti_result_title"] = t["anti_antithesis_button"]
+                        st.session_state["anti_result"] = final_antithesis
+                        st.session_state["anti_last_action"] = "antithesis"
+                        st.session_state["anti_last_raw"] = antithesis
+                        st.session_state["anti_last_review"] = review
+                        st.session_state["anti_last_params"] = {
+                            "action": "antithesis",
+                            "k": st.session_state.get("anti_top_k", 3),
+                            "chunk_size": st.session_state.get("anti_chunk_size", 500),
+                            "chunk_overlap": st.session_state.get("anti_chunk_overlap", 100),
+                        }
+
                     else:
-                        from documind.anti.rag.chain import get_revision_chain
+                        if "antithesis" not in st.session_state:
+                            st.warning(t["anti_revision_missing"])
+                        else:
+                            from documind.anti.rag.chain import (
+                                get_revision_chain,
+                                get_revision_critic_chain,
+                                get_revision_refine_chain,
+                            )
+                            from documind.anti.rag.claude import get_claude_critic
 
-                        llm, retriever = _get_anti_retriever()
-                        if not llm or not retriever:
-                            st.stop()
-                        revision_chain = get_revision_chain(llm, retriever)
-                        with st.spinner("문서 개선 중..." if lang == "ko" else "Rewriting..."):
-                            revised = revision_chain.invoke({
-                                "antithesis": st.session_state["antithesis"]
-                            })
-                        st.markdown(f"### {t['anti_revision_button']}")
-                        st.write(revised)
+                            revision_chain = get_revision_chain(llm, retriever)
+                            with st.spinner("문서 개선 중..." if lang == "ko" else "Rewriting..."):
+                                revised = revision_chain.invoke(
+                                    {"antithesis": st.session_state["antithesis"]}
+                                )
+
+                            critic_llm = get_claude_critic()
+                            critic_chain = get_revision_critic_chain(critic_llm, retriever)
+                            refine_chain = get_revision_refine_chain(llm, retriever)
+                            max_rounds = 2
+                            score_threshold = 85
+                            review = ""
+                            final_revision = revised
+                            passed = False
+                            for _ in range(max_rounds):
+                                with st.spinner("검수 중..." if lang == "ko" else "Reviewing..."):
+                                    review = critic_chain.invoke(
+                                        {
+                                            "antithesis": st.session_state["antithesis"],
+                                            "revision": final_revision,
+                                        }
+                                    )
+                                verdict_match = re.search(
+                                    r"verdict\\s*:\\s*(PASS|FAIL)", review, re.IGNORECASE
+                                )
+                                verdict = verdict_match.group(1).upper() if verdict_match else "PASS"
+                                score_match = re.search(
+                                    r"score\\s*:\\s*(\\d+)", review, re.IGNORECASE
+                                )
+                                score = int(score_match.group(1)) if score_match else score_threshold
+                                if verdict == "PASS" or score >= score_threshold:
+                                    passed = True
+                                    break
+                                with st.spinner("수정 중..." if lang == "ko" else "Refining..."):
+                                    final_revision = refine_chain.invoke(
+                                        {
+                                            "antithesis": st.session_state["antithesis"],
+                                            "revision": final_revision,
+                                            "review": review,
+                                        }
+                                    )
+
+                            if st.session_state.get("anti_result"):
+                                st.session_state["anti_prev_result"] = st.session_state["anti_result"]
+                                st.session_state["anti_prev_params"] = st.session_state.get("anti_last_params")
+                            st.session_state["anti_result_title"] = t["anti_revision_button"]
+                            st.session_state["anti_result"] = final_revision
+                            st.session_state["anti_quality_passed"] = passed
+                            st.session_state["anti_last_action"] = "revision"
+                            st.session_state["anti_last_raw"] = revised
+                            st.session_state["anti_last_review"] = review
+                            st.session_state["anti_last_params"] = {
+                                "action": "revision",
+                                "k": st.session_state.get("anti_top_k", 3),
+                                "chunk_size": st.session_state.get("anti_chunk_size", 500),
+                                "chunk_overlap": st.session_state.get("anti_chunk_overlap", 100),
+                            }
+                finally:
+                    st.session_state["anti_running"] = False
+
+            if st.session_state.get("anti_result"):
+                result_title = st.session_state.get("anti_result_title") or t["anti_result_title"]
+                st.markdown(f"### {result_title}")
+                if st.session_state.get("anti_quality_passed") is False:
+                    st.warning("검수 기준을 충분히 통과하지 못한 결과입니다. 참고용으로 확인해 주세요.")
+                    if st.button("다시 시도", use_container_width=True):
+                        st.session_state["anti_retry_request"] = True
+                        st.rerun()
+
+                from documind.utils.export import (
+                    create_txt_bytes,
+                    create_docx_bytes,
+                    create_pdf_bytes,
+                )
+
+                result_text = str(st.session_state["anti_result"])
+                base_name = f"anti_{st.session_state.get('anti_last_action', selected_action)}"
+                raw_text = st.session_state.get("anti_last_raw")
+                review_text = st.session_state.get("anti_last_review")
+                quality_passed = st.session_state.get("anti_quality_passed")
+                last_params = st.session_state.get("anti_last_params") or {}
+                prev_result = st.session_state.get("anti_prev_result")
+                prev_params = st.session_state.get("anti_prev_params") or {}
+                raw_is_same = (
+                    isinstance(raw_text, str)
+                    and raw_text.strip()
+                    and raw_text.strip() == result_text.strip()
+                )
+
+                tab_result, tab_compare, tab_download = st.tabs(["결과", "비교", "다운로드"])
+                with tab_result:
+                    st.write(result_text)
+                with tab_compare:
+                    if raw_is_same:
+                        st.info("초안과 최종 결과가 동일합니다.")
+                    elif raw_text:
+                        left, right = st.columns(2)
+                        with left:
+                            st.markdown("**초안**")
+                            st.write(raw_text)
+                        with right:
+                            st.markdown("**최종**")
+                            st.write(result_text)
+                    elif prev_result:
+                        left, right = st.columns(2)
+                        with left:
+                            st.markdown("**이전 결과**")
+                            st.write(prev_result)
+                            if prev_params:
+                                st.caption(
+                                    f"k={prev_params.get('k')} · chunk={prev_params.get('chunk_size')} · overlap={prev_params.get('chunk_overlap')}"
+                                )
+                        with right:
+                            st.markdown("**현재 결과**")
+                            st.write(result_text)
+                            if last_params:
+                                st.caption(
+                                    f"k={last_params.get('k')} · chunk={last_params.get('chunk_size')} · overlap={last_params.get('chunk_overlap')}"
+                                )
+                    elif review_text:
+                        st.write(review_text)
+                    else:
+                        st.info("비교할 데이터가 없습니다.")
+                with tab_download:
+                    d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+                    with d_col1:
+                        st.download_button(
+                            "TXT 다운로드",
+                            data=create_txt_bytes(result_text),
+                            file_name=f"{base_name}.txt",
+                            mime="text/plain",
+                            use_container_width=True,
+                        )
+                    with d_col2:
+                        st.download_button(
+                            "DOCX 다운로드",
+                            data=create_docx_bytes(result_text),
+                            file_name=f"{base_name}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                        )
+                    with d_col3:
+                        st.download_button(
+                            "PDF 다운로드",
+                            data=create_pdf_bytes(result_text),
+                            file_name=f"{base_name}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
+                    with d_col4:
+                        json_payload = {
+                            "action": st.session_state.get("anti_last_action", selected_action),
+                            "quality_passed": quality_passed,
+                            "result": result_text,
+                            "draft": raw_text,
+                            "review": review_text,
+                        }
+                        st.download_button(
+                            "JSON 다운로드",
+                            data=json.dumps(json_payload, ensure_ascii=False, indent=2),
+                            file_name=f"{base_name}.json",
+                            mime="application/json",
+                            use_container_width=True,
+                        )
         st.stop()
 
     if mode_key == "optim":
